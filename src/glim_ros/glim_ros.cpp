@@ -297,6 +297,13 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     return 0;
   }
   auto preprocessed = preprocessor->preprocess(raw_points);
+  if (!preprocessed) {
+    spdlog::warn(
+      "[scan_guard] preprocessed frame is nullptr, skip LiDAR update stamp={} raw_points={}",
+      raw_points ? raw_points->stamp : 0.0,
+      raw_points ? raw_points->size() : 0);
+    return 0;
+  }
 
   if (keep_raw_points) {
     // note: Raw points are used only in extension modules for visualization purposes.
