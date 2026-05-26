@@ -291,6 +291,13 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     return 0;
   }
 
+  if (raw_points->size() == 0) {
+    spdlog::warn(
+      "[scan_guard] raw point cloud is empty, skip LiDAR update stamp={}",
+      raw_points->stamp);
+    return 0;
+  }
+
   raw_points->stamp += points_time_offset;
   if (!time_keeper->process(raw_points)) {
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
