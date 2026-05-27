@@ -4,6 +4,8 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <numeric>
+#include <unordered_map>
 #include <spdlog/spdlog.h>
 #include <boost/format.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -19,6 +21,7 @@
 #include <glim/util/extension_module_ros2.hpp>
 #include <glim_ros/glim_ros.hpp>
 #include <glim_ros/ros_compatibility.hpp>
+#include <glim_ros/bag_progress.hpp>
 
 class SpeedCounter {
 public:
@@ -89,6 +92,38 @@ private:
   struct termios original_termios_;
 };
 
+
+namespace {
+
+std::unordered_map<std::string, std::size_t> topic_message_counts_from_metadata(
+    const rosbag2_storage::BagMetadata& metadata,
+    const std::vector<std::string>& selected_topics) {
+  std::unordered_map<std::string, std::size_t> out;
+
+  for (const auto& topic : selected_topics) {
+    out[topic] = 0;
+  }
+
+  for (const auto& topic_info : metadata.topics_with_message_count) {
+    const auto& name = topic_info.topic_metadata.name;
+
+    if (std::find(selected_topics.begin(), selected_topics.end(), name) == selected_topics.end()) {
+      continue;
+    }
+
+    out[name] += static_cast<std::size_t>(topic_info.message_count);
+  }
+
+  return out;
+}
+
+double duration_sec_from_metadata(const rosbag2_storage::BagMetadata& metadata) {
+  return std::chrono::duration_cast<std::chrono::duration<double>>(metadata.duration).count();
+}
+
+}  // namespace
+
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: glim_rosbag input_rosbag_path" << std::endl;
@@ -142,6 +177,33 @@ int main(int argc, char** argv) {
   for (const auto& bag_filename : bag_filenames) {
     spdlog::info("- {}", bag_filename);
   }
+
+  std::unordered_map<std::string, std::size_t> progress_total_counts;
+  for (const auto& topic : filter.topics) {
+    progress_total_counts[topic] = 0;
+  }
+
+  double progress_total_duration_sec = 0.0;
+
+  for (const auto& bag_filename : bag_filenames) {
+    try {
+      rosbag2_storage::MetadataIo metadata_io;
+      const auto metadata = metadata_io.read_metadata(bag_filename);
+
+      const auto counts = topic_message_counts_from_metadata(metadata, filter.topics);
+      for (const auto& [topic, count] : counts) {
+        progress_total_counts[topic] += count;
+      }
+
+      progress_total_duration_sec += duration_sec_from_metadata(metadata);
+    } catch (const std::exception& e) {
+      spdlog::warn("[bag_progress] failed to read metadata for {}: {}", bag_filename, e.what());
+    }
+  }
+
+  glim_ros::BagProgress bag_progress(2.0);
+  bag_progress.set_totals(progress_total_counts, progress_total_duration_sec);
+  bag_progress.force_log();
 
   // Playback range settings
   double delay = 0.0;
@@ -255,6 +317,7 @@ int main(int argc, char** argv) {
       if (bag_t0 == 0) {
         bag_t0 = msg_time;
       }
+      bag_progress.on_message(msg->topic_name, msg_time / 1e9);
       spdlog::debug("msg_time: {} ({} sec)", msg_time / 1e9, (msg_time - bag_t0) / 1e9);
 
       if (start_offset > 0.0) {
@@ -371,6 +434,7 @@ int main(int argc, char** argv) {
       }
     }
 
+    bag_progress.finish_log();
     return true;
   };
 
@@ -394,8 +458,18 @@ int main(int argc, char** argv) {
     rclcpp::spin(glim);
   }
 
-  glim->wait(auto_quit);
-  glim->save(dump_path);
+  {
+    const double drain_start = glim_ros::BagProgress::now_sec();
+    spdlog::info("[bag_progress] drain begin auto_quit={}", auto_quit);
+    glim->wait(auto_quit);
+    glim_ros::BagProgress::drain_log("glim_wait", drain_start);
+  }
+
+  {
+    const double save_start = glim_ros::BagProgress::now_sec();
+    glim->save(dump_path);
+    glim_ros::BagProgress::drain_log("save_dump", save_start);
+  }
 
   return 0;
 }
