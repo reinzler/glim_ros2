@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <future>
 #include <numeric>
 #include <unordered_map>
 #include <spdlog/spdlog.h>
@@ -461,14 +462,33 @@ int main(int argc, char** argv) {
   {
     const double drain_start = glim_ros::BagProgress::now_sec();
     spdlog::info("[bag_progress] drain begin auto_quit={}", auto_quit);
-    glim->wait(auto_quit);
-    glim_ros::BagProgress::drain_log("glim_wait", drain_start);
+
+    auto wait_future = std::async(std::launch::async, [&] {
+      glim->wait(auto_quit);
+    });
+
+    while (wait_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      glim_ros::BagProgress::drain_log("glim_wait", drain_start);
+    }
+
+    wait_future.get();
+    glim_ros::BagProgress::drain_log("glim_wait_done", drain_start);
   }
 
   {
     const double save_start = glim_ros::BagProgress::now_sec();
-    glim->save(dump_path);
-    glim_ros::BagProgress::drain_log("save_dump", save_start);
+    spdlog::info("[bag_progress] save begin path={}", dump_path);
+
+    auto save_future = std::async(std::launch::async, [&] {
+      glim->save(dump_path);
+    });
+
+    while (save_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      glim_ros::BagProgress::drain_log("save_dump", save_start);
+    }
+
+    save_future.get();
+    glim_ros::BagProgress::drain_log("save_dump_done", save_start);
   }
 
   return 0;

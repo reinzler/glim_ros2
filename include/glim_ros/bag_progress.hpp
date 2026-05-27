@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstddef>
 #include <iomanip>
+#include <unistd.h>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -65,6 +67,8 @@ public:
   }
 
   void finish_log() const {
+    finish_progress_line();
+
     const double elapsed = wall_elapsed_sec();
     const double msg_rate = elapsed > 1e-9 ? static_cast<double>(read_messages_) / elapsed : 0.0;
 
@@ -83,10 +87,58 @@ public:
 
   static void drain_log(const std::string& phase, double phase_start_sec) {
     const double elapsed = now_sec() - phase_start_sec;
-    spdlog::info(
-      "[bag_progress] drain phase={} elapsed={} eta=n/a",
-      phase,
-      format_duration(elapsed));
+    std::ostringstream line;
+    line
+      << "[bag_progress] drain "
+      << phase
+      << " elapsed=" << format_duration(elapsed);
+
+    print_progress_line(line.str());
+  }
+
+
+public:
+  static std::string make_bar(double ratio, int width = 32) {
+    ratio = std::max(0.0, std::min(1.0, ratio));
+    const int filled = static_cast<int>(ratio * width + 0.5);
+
+    std::string bar;
+    bar.reserve(width + 2);
+    bar.push_back('[');
+
+    for (int i = 0; i < width; i++) {
+      bar.push_back(i < filled ? '#' : '.');
+    }
+
+    bar.push_back(']');
+    return bar;
+  }
+
+  static bool progress_tty_enabled() {
+    return isatty(STDERR_FILENO);
+  }
+
+  static void print_progress_line(const std::string& line) {
+    static std::size_t last_len = 0;
+
+    if (progress_tty_enabled()) {
+      std::cerr << '\r' << line;
+
+      if (last_len > line.size()) {
+        std::cerr << std::string(last_len - line.size(), ' ');
+      }
+
+      std::cerr << std::flush;
+      last_len = line.size();
+    } else {
+      spdlog::info("{}", line);
+    }
+  }
+
+  static void finish_progress_line() {
+    if (progress_tty_enabled()) {
+      std::cerr << std::endl;
+    }
   }
 
 private:
@@ -159,19 +211,30 @@ private:
       replay_speed = bag_elapsed / wall_elapsed;
     }
 
-    spdlog::info(
-      "[bag_progress] read={}/{} {}% bag={}/{} wall={} speed={}x msg/s={} eta={}",
-      read_messages_,
-      total_messages_,
-      format_double(pct, 1),
-      format_duration(bag_elapsed),
-      bag_duration_sec_ > 0.0 ? format_duration(bag_duration_sec_) : "n/a",
-      format_duration(wall_elapsed),
-      format_double(replay_speed, 2),
-      format_double(msg_rate, 1),
-      eta_sec >= 0.0 ? format_duration(eta_sec) : "n/a");
+    {
+      const double ratio =
+        total_messages_ > 0
+          ? static_cast<double>(read_messages_) / static_cast<double>(total_messages_)
+          : 0.0;
 
-    if (!topics_.empty()) {
+      std::ostringstream line;
+      line
+        << "[bag_progress] "
+        << make_bar(ratio)
+        << " "
+        << read_messages_ << "/" << total_messages_
+        << " " << format_double(pct, 1) << "%"
+        << " bag=" << format_duration(bag_elapsed)
+        << "/" << (bag_duration_sec_ > 0.0 ? format_duration(bag_duration_sec_) : "n/a")
+        << " wall=" << format_duration(wall_elapsed)
+        << " speed=" << format_double(replay_speed, 2) << "x"
+        << " msg/s=" << format_double(msg_rate, 1)
+        << " eta=" << (eta_sec >= 0.0 ? format_duration(eta_sec) : "n/a");
+
+      print_progress_line(line.str());
+    }
+
+    if (!topics_.empty() && !progress_tty_enabled()) {
       std::vector<std::string> keys;
       keys.reserve(topics_.size());
       for (const auto& [topic, _] : topics_) {
