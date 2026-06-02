@@ -5,6 +5,7 @@
 #include <deque>
 #include <thread>
 #include <iostream>
+#include <string>
 #include <functional>
 #include <boost/format.hpp>
 #include <spdlog/spdlog.h>
@@ -36,6 +37,13 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
+#include <chrono>
+#include <future>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <cmath>
 
 namespace glim {
 
@@ -362,8 +370,161 @@ void GlimROS::timer_callback() {
 }
 
 void GlimROS::wait(bool auto_quit) {
-  spdlog::info("waiting for odometry estimation");
-  odometry_estimation->join();
+  auto memory_usage_ratio = []() -> double {
+    std::ifstream ifs("/proc/meminfo");
+    if (!ifs) {
+      return -1.0;
+    }
+
+    long long mem_total_kb = -1;
+    long long mem_available_kb = -1;
+
+    std::string key;
+    long long value = 0;
+    std::string unit;
+
+    while (ifs >> key >> value >> unit) {
+      if (key == "MemTotal:") {
+        mem_total_kb = value;
+      } else if (key == "MemAvailable:") {
+        mem_available_kb = value;
+      }
+
+      if (mem_total_kb > 0 && mem_available_kb >= 0) {
+        break;
+      }
+    }
+
+    if (mem_total_kb <= 0 || mem_available_kb < 0) {
+      return -1.0;
+    }
+
+    return static_cast<double>(mem_total_kb - mem_available_kb) /
+           static_cast<double>(mem_total_kb);
+  };
+
+  auto make_bar = [](double ratio, int width = 28) -> std::string {
+    ratio = std::max(0.0, std::min(1.0, ratio));
+    const int filled = static_cast<int>(std::round(ratio * width));
+
+    std::string bar;
+    bar.reserve(width + 2);
+    bar.push_back('[');
+    for (int i = 0; i < width; i++) {
+      bar.push_back(i < filled ? '#' : '.');
+    }
+    bar.push_back(']');
+    return bar;
+  };
+
+  auto wait_with_progress = [&](
+    const std::string& label,
+    const std::string& unit_name,
+    const std::function<size_t()>& workload_fn,
+    const std::function<void()>& join_fn) {
+    const auto begin = std::chrono::steady_clock::now();
+
+    size_t initial_pending = 0;
+    try {
+      initial_pending = workload_fn();
+    } catch (...) {
+      initial_pending = 0;
+    }
+
+    spdlog::info(
+      "\033[1;35m[drain]\033[0m {} started: initial_pending={} unit={}",
+      label,
+      initial_pending,
+      unit_name);
+
+    auto future = std::async(std::launch::async, [&]() {
+      join_fn();
+    });
+
+    size_t last_pending = initial_pending;
+    int stable_pending_sec = 0;
+
+    while (rclcpp::ok()) {
+      const auto status = future.wait_for(std::chrono::milliseconds(500));
+      const auto now = std::chrono::steady_clock::now();
+      const auto elapsed_sec =
+        std::chrono::duration_cast<std::chrono::seconds>(now - begin).count();
+
+      size_t pending = 0;
+      try {
+        pending = workload_fn();
+      } catch (...) {
+        pending = 0;
+      }
+
+      if (pending == last_pending) {
+        stable_pending_sec++;
+      } else {
+        stable_pending_sec = 0;
+      }
+      last_pending = pending;
+
+      const size_t done_est =
+        initial_pending > pending ? initial_pending - pending : 0;
+
+      const double queue_ratio =
+        initial_pending > 0
+          ? static_cast<double>(done_est) / static_cast<double>(initial_pending)
+          : (pending == 0 ? 1.0 : 0.0);
+
+      const std::string phase =
+        pending > 0 ? "processing_queue" : "finalizing_join";
+
+      const double mem = memory_usage_ratio();
+
+      std::ostringstream oss;
+      oss
+        << "\r\033[1;36m[drain_progress]\033[0m "
+        << label << " "
+        << make_bar(queue_ratio)
+        << " queue=" << done_est << "/" << initial_pending
+        << " pending=" << pending
+        << " unit=" << unit_name
+        << " phase=" << phase
+        << " stable=" << stable_pending_sec / 2 << "s"
+        << " elapsed=" << elapsed_sec << "s";
+
+      if (mem >= 0.0) {
+        oss << " mem=" << std::fixed << std::setprecision(1) << (mem * 100.0) << "%";
+      }
+
+      oss << "      ";
+
+      std::cerr << oss.str() << std::flush;
+
+      if (status == std::future_status::ready) {
+        future.get();
+        std::cerr << std::endl;
+
+        spdlog::info(
+          "\033[1;32m[drain_done]\033[0m {} done: initial_pending={} final_pending={} elapsed={}s",
+          label,
+          initial_pending,
+          pending,
+          elapsed_sec);
+        return;
+      }
+    }
+
+    future.wait();
+    future.get();
+    std::cerr << std::endl;
+  };
+
+  wait_with_progress(
+    "odometry_estimation",
+    "lidar_frames",
+    [this]() -> size_t {
+      return odometry_estimation ? odometry_estimation->workload() : 0;
+    },
+    [this]() {
+      odometry_estimation->join();
+    });
 
   if (sub_mapping) {
     std::vector<glim::EstimationFrame::ConstPtr> estimation_results;
@@ -373,26 +534,43 @@ void GlimROS::wait(bool auto_quit) {
       sub_mapping->insert_frame(marginalized_frame);
     }
 
-    spdlog::info("waiting for local mapping");
-    sub_mapping->join();
+    wait_with_progress(
+      "local_mapping",
+      "marginalized_frames",
+      [this]() -> size_t {
+        return sub_mapping ? sub_mapping->workload() : 0;
+      },
+      [this]() {
+        sub_mapping->join();
+      });
 
     const auto submaps = sub_mapping->get_results();
     if (global_mapping) {
       for (const auto& submap : submaps) {
         global_mapping->insert_submap(submap);
       }
-      spdlog::info("waiting for global mapping");
-      global_mapping->join();
+
+      wait_with_progress(
+        "global_mapping",
+        "submaps",
+        [this]() -> size_t {
+          return global_mapping ? global_mapping->workload() : 0;
+        },
+        [this]() {
+          global_mapping->join();
+        });
     }
   }
 
   if (!auto_quit) {
+    spdlog::info("\033[1;35m[drain]\033[0m waiting for extension modules");
     bool terminate = false;
     while (!terminate && rclcpp::ok()) {
       for (const auto& ext_module : extension_modules) {
         terminate |= (!ext_module->ok());
       }
     }
+    spdlog::info("\033[1;32m[drain_done]\033[0m extension modules finished");
   }
 }
 

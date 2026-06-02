@@ -66,6 +66,7 @@ target_link_libraries(glim_rosnode
 ### glim_rosbag ###
 ament_auto_add_executable(glim_rosbag
   src/glim_rosbag.cpp
+  src/glim_ros/multi_lidar_cloud_merger.cpp
 )
 target_link_libraries(glim_rosbag
   glim_ros

@@ -23,6 +23,9 @@
 #include <glim_ros/glim_ros.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/bag_progress.hpp>
+#include <glim_ros/multi_lidar_cloud_merger.hpp>
+#include <fstream>
+#include <algorithm>
 
 class SpeedCounter {
 public:
@@ -125,6 +128,109 @@ double duration_sec_from_metadata(const rosbag2_storage::BagMetadata& metadata) 
 }  // namespace
 
 
+
+namespace {
+
+struct MemoryPauseConfig {
+  bool enabled = true;
+  double high_ratio = 0.91;
+  double resume_ratio = 0.86;
+  int check_interval_ms = 500;
+  double log_interval_sec = 5.0;
+};
+
+bool read_meminfo_kb(long long& mem_total_kb, long long& mem_available_kb) {
+  std::ifstream ifs("/proc/meminfo");
+  if (!ifs) {
+    return false;
+  }
+
+  mem_total_kb = -1;
+  mem_available_kb = -1;
+
+  std::string key;
+  long long value = 0;
+  std::string unit;
+
+  while (ifs >> key >> value >> unit) {
+    if (key == "MemTotal:") {
+      mem_total_kb = value;
+    } else if (key == "MemAvailable:") {
+      mem_available_kb = value;
+    }
+
+    if (mem_total_kb > 0 && mem_available_kb >= 0) {
+      return true;
+    }
+  }
+
+  return mem_total_kb > 0 && mem_available_kb >= 0;
+}
+
+double system_memory_usage_ratio() {
+  long long total_kb = 0;
+  long long available_kb = 0;
+
+  if (!read_meminfo_kb(total_kb, available_kb) || total_kb <= 0) {
+    return 0.0;
+  }
+
+  const double used = static_cast<double>(total_kb - available_kb);
+  return std::clamp(used / static_cast<double>(total_kb), 0.0, 1.0);
+}
+
+void wait_for_memory_if_needed(
+  const MemoryPauseConfig& cfg,
+  const std::shared_ptr<glim::GlimROS>& glim) {
+  if (!cfg.enabled) {
+    return;
+  }
+
+  double usage = system_memory_usage_ratio();
+  if (usage < cfg.high_ratio) {
+    return;
+  }
+
+  spdlog::warn(
+    "[mem_guard] pausing rosbag reading: RAM usage {:.2f}% >= {:.2f}%",
+    usage * 100.0,
+    cfg.high_ratio * 100.0);
+
+  auto last_log = std::chrono::steady_clock::now();
+
+  while (rclcpp::ok()) {
+    rclcpp::spin_some(glim);
+
+    // Let GLIM process already queued work while we stop feeding new bag messages.
+    glim->timer_callback();
+
+    usage = system_memory_usage_ratio();
+    if (usage <= cfg.resume_ratio) {
+      spdlog::warn(
+        "[mem_guard] resuming rosbag reading: RAM usage {:.2f}% <= {:.2f}%",
+        usage * 100.0,
+        cfg.resume_ratio * 100.0);
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log).count();
+
+    if (elapsed >= cfg.log_interval_sec) {
+      spdlog::warn(
+        "[mem_guard] still paused: RAM usage {:.2f}% > resume {:.2f}%",
+        usage * 100.0,
+        cfg.resume_ratio * 100.0);
+      last_log = now;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(cfg.check_interval_ms));
+  }
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: glim_rosbag input_rosbag_path" << std::endl;
@@ -141,7 +247,27 @@ int main(int argc, char** argv) {
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "/imu");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
-  std::vector<std::string> topics = {imu_topic, points_topic, image_topic};
+
+  glim_ros::MultiLidarMergerConfig multi_lidar_config;
+  multi_lidar_config.enabled = config_ros.param<bool>("multi_lidar", "enabled", false);
+  multi_lidar_config.target_frame = config_ros.param<std::string>("multi_lidar", "target_frame", "lidar");
+  multi_lidar_config.lidar_topics = config_ros.param<std::vector<std::string>>("multi_lidar", "lidar_topics", {});
+  multi_lidar_config.lidar_serials = config_ros.param<std::vector<std::string>>("multi_lidar", "lidar_serials", {});
+  multi_lidar_config.lidar_ids = config_ros.param<std::vector<int>>("multi_lidar", "lidar_ids", {});
+  multi_lidar_config.calibration_file = config_ros.param<std::string>("multi_lidar", "calibration_file", "");
+  multi_lidar_config.sync_tolerance_sec = config_ros.param<double>("multi_lidar", "sync_tolerance_sec", 0.03);
+  multi_lidar_config.allow_incomplete_lidar_group = config_ros.param<bool>("multi_lidar", "allow_incomplete_lidar_group", false);
+  multi_lidar_config.max_cloud_buffer_size = config_ros.param<int>("multi_lidar", "max_cloud_buffer_size", 50);
+
+  glim_ros::MultiLidarCloudMerger multi_lidar(multi_lidar_config);
+
+  std::vector<std::string> topics = {imu_topic, image_topic};
+
+  if (multi_lidar.enabled()) {
+    topics.insert(topics.end(), multi_lidar.topics().begin(), multi_lidar.topics().end());
+  } else {
+    topics.push_back(points_topic);
+  }
 
   rosbag2_storage::StorageFilter filter;
   spdlog::info("topics:");
@@ -240,6 +366,27 @@ int main(int argc, char** argv) {
 
   // Keyboard handler for pause/resume
   KeyboardHandler keyboard;
+  // Memory guard for UAV/offline processing.
+  MemoryPauseConfig memory_pause_cfg;
+  glim->declare_parameter("glim_rosbag/memory_pause_enabled", memory_pause_cfg.enabled);
+  glim->declare_parameter("glim_rosbag/memory_pause_high_ratio", memory_pause_cfg.high_ratio);
+  glim->declare_parameter("glim_rosbag/memory_pause_resume_ratio", memory_pause_cfg.resume_ratio);
+  glim->declare_parameter("glim_rosbag/memory_pause_check_interval_ms", memory_pause_cfg.check_interval_ms);
+  glim->declare_parameter("glim_rosbag/memory_pause_log_interval_sec", memory_pause_cfg.log_interval_sec);
+
+  glim->get_parameter("glim_rosbag/memory_pause_enabled", memory_pause_cfg.enabled);
+  glim->get_parameter("glim_rosbag/memory_pause_high_ratio", memory_pause_cfg.high_ratio);
+  glim->get_parameter("glim_rosbag/memory_pause_resume_ratio", memory_pause_cfg.resume_ratio);
+  glim->get_parameter("glim_rosbag/memory_pause_check_interval_ms", memory_pause_cfg.check_interval_ms);
+  glim->get_parameter("glim_rosbag/memory_pause_log_interval_sec", memory_pause_cfg.log_interval_sec);
+
+  spdlog::info(
+    "[mem_guard] enabled={} high={:.2f}% resume={:.2f}% check={}ms",
+    memory_pause_cfg.enabled,
+    memory_pause_cfg.high_ratio * 100.0,
+    memory_pause_cfg.resume_ratio * 100.0,
+    memory_pause_cfg.check_interval_ms);
+
 
   // Bag read function
   const auto read_bag = [&](const std::string& bag_filename) {
@@ -306,6 +453,7 @@ int main(int argc, char** argv) {
       }
       rclcpp::spin_some(glim);
 
+      wait_for_memory_if_needed(memory_pause_cfg, glim);
       const auto msg = reader.read_next();
       const std::string topic_type = topic_type_map[msg->topic_name];
       const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
@@ -372,7 +520,7 @@ int main(int argc, char** argv) {
         auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
         imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
         glim->imu_callback(imu_msg);
-      } else if (msg->topic_name == points_topic) {
+      } else if (((!multi_lidar.enabled() && msg->topic_name == points_topic) || (multi_lidar.enabled() && multi_lidar.is_lidar_topic(msg->topic_name)))) {
         if (topic_type != "sensor_msgs/msg/PointCloud2") {
           spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
           return false;
