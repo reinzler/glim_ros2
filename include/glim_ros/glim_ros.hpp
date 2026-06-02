@@ -3,6 +3,8 @@
 #include <any>
 #include <deque>
 #include <memory>
+#include <string>
+#include <vector>
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
@@ -33,6 +35,12 @@ public:
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
 #ifdef BUILD_WITH_CV_BRIDGE
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg);
+  void camera_image_callback(
+    const sensor_msgs::msg::Image::ConstSharedPtr msg,
+    int camera_id,
+    const std::string& camera_name,
+    const std::string& default_frame_id);
+
 #endif
   size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
 
@@ -67,6 +75,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
+  std::vector<image_transport::Subscriber> camera_image_subs;
+
 #endif
 };
 

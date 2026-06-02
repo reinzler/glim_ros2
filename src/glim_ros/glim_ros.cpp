@@ -6,6 +6,7 @@
 #include <thread>
 #include <iostream>
 #include <string>
+#include <vector>
 #include <functional>
 #include <boost/format.hpp>
 #include <spdlog/spdlog.h>
@@ -33,6 +34,7 @@
 #include <glim/util/extension_module_ros2.hpp>
 #include <glim/preprocess/cloud_preprocessor.hpp>
 #include <glim/odometry/async_odometry_estimation.hpp>
+#include <glim/odometry/callbacks.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
@@ -185,19 +187,88 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   using std::placeholders::_1;
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "");
-  const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
 
   // Subscribers
   rclcpp::SensorDataQoS default_imu_qos;
   default_imu_qos.get_rmw_qos_profile().depth = 1000;
+
   auto qos = get_qos_settings(config_ros, "glim_ros", "imu_qos", default_imu_qos);
-  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos, std::bind(&GlimROS::imu_callback, this, _1));
+  imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(
+    imu_topic,
+    qos,
+    std::bind(&GlimROS::imu_callback, this, _1));
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(points_topic, qos, std::bind(&GlimROS::points_callback, this, _1));
+  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    points_topic,
+    qos,
+    std::bind(&GlimROS::points_callback, this, _1));
+
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
-  image_sub = image_transport::create_subscription(this, image_topic, std::bind(&GlimROS::image_callback, this, _1), "raw", qos.get_rmw_qos_profile());
+
+  const auto image_topics = config_ros.param<std::vector<std::string>>(
+    "glim_ros",
+    "image_topics",
+    std::vector<std::string>());
+
+  const auto image_names = config_ros.param<std::vector<std::string>>(
+    "glim_ros",
+    "image_names",
+    std::vector<std::string>());
+
+  const auto image_frames = config_ros.param<std::vector<std::string>>(
+    "glim_ros",
+    "image_frames",
+    std::vector<std::string>());
+
+  if (!image_topics.empty()) {
+    for (size_t i = 0; i < image_topics.size(); i++) {
+      if (image_topics[i].empty()) {
+        continue;
+      }
+
+      const int camera_id = static_cast<int>(i);
+      const std::string camera_name =
+        i < image_names.size() && !image_names[i].empty()
+          ? image_names[i]
+          : ("camera" + std::to_string(i));
+
+      const std::string camera_frame =
+        i < image_frames.size()
+          ? image_frames[i]
+          : "";
+
+      spdlog::info(
+        "image_topic[{}]: {} name={} frame={}",
+        camera_id,
+        image_topics[i],
+        camera_name,
+        camera_frame);
+
+      camera_image_subs.emplace_back(image_transport::create_subscription(
+        this,
+        image_topics[i],
+        [this, camera_id, camera_name, camera_frame](const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+          this->camera_image_callback(msg, camera_id, camera_name, camera_frame);
+        },
+        "raw",
+        qos.get_rmw_qos_profile()));
+    }
+  } else {
+    const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "");
+
+    if (!image_topic.empty()) {
+      spdlog::info("image_topic: {}", image_topic);
+
+      image_sub = image_transport::create_subscription(
+        this,
+        image_topic,
+        std::bind(&GlimROS::image_callback, this, _1),
+        "raw",
+        qos.get_rmw_qos_profile());
+    }
+  }
 #endif
 
   for (const auto& sub : this->extension_subscriptions()) {
@@ -267,23 +338,63 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 
 #ifdef BUILD_WITH_CV_BRIDGE
 void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
-  spdlog::trace("image: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
-  if (!GlobalConfig::instance()->has_param("meta", "image_frame")) {
-    spdlog::debug("auto-detecting image frame ID: {}", msg->header.frame_id);
-    GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
+  camera_image_callback(msg, 0, "camera0", "");
+}
+
+void GlimROS::camera_image_callback(
+  const sensor_msgs::msg::Image::ConstSharedPtr msg,
+  int camera_id,
+  const std::string& camera_name,
+  const std::string& default_frame_id) {
+  if (!msg) {
+    return;
+  }
+
+  spdlog::trace(
+    "image[{}:{}]: {}.{}",
+    camera_id,
+    camera_name,
+    msg->header.stamp.sec,
+    msg->header.stamp.nanosec);
+
+  const std::string frame_id = msg->header.frame_id.empty() ? default_frame_id : msg->header.frame_id;
+
+  if (camera_id == 0 && !GlobalConfig::instance()->has_param("meta", "image_frame")) {
+    spdlog::debug("auto-detecting primary image frame ID: {}", frame_id);
+    GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", frame_id);
   }
 
   auto cv_image = cv_bridge::toCvCopy(msg, "bgr8");
-
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
-  odometry_estimation->insert_image(stamp, cv_image->image);
-  if (sub_mapping) {
-    sub_mapping->insert_image(stamp, cv_image->image);
-  }
-  if (global_mapping) {
-    global_mapping->insert_image(stamp, cv_image->image);
+
+#ifdef GLIM_USE_OPENCV
+  auto image_ptr = std::make_shared<cv::Mat>(cv_image->image.clone());
+
+  auto image_frame = std::make_shared<glim::CameraImageFrame>(
+    stamp,
+    camera_id,
+    camera_name,
+    frame_id,
+    image_ptr);
+
+  glim::OdometryEstimationCallbacks::on_insert_image_frame(image_frame);
+#endif
+
+  // Backward compatibility:
+  // only primary camera enters the old single-camera GLIM image pipeline.
+  if (camera_id == 0) {
+    odometry_estimation->insert_image(stamp, cv_image->image);
+
+    if (sub_mapping) {
+      sub_mapping->insert_image(stamp, cv_image->image);
+    }
+
+    if (global_mapping) {
+      global_mapping->insert_image(stamp, cv_image->image);
+    }
   }
 }
+
 #endif
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
