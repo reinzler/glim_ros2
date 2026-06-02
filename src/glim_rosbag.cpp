@@ -247,6 +247,26 @@ int main(int argc, char** argv) {
   const std::string imu_topic = config_ros.param<std::string>("glim_ros", "imu_topic", "/imu");
   const std::string points_topic = config_ros.param<std::string>("glim_ros", "points_topic", "/points");
   const std::string image_topic = config_ros.param<std::string>("glim_ros", "image_topic", "/image");
+  auto image_topics = config_ros.param<std::vector<std::string>>("glim_ros", "image_topics", {});
+  const auto image_names = config_ros.param<std::vector<std::string>>("glim_ros", "image_names", {});
+  const auto image_frames = config_ros.param<std::vector<std::string>>("glim_ros", "image_frames", {});
+
+  if (image_topics.empty() && !image_topic.empty()) {
+    image_topics.push_back(image_topic);
+  }
+
+  const auto image_topic_index = [&](const std::string& topic) -> int {
+    const auto found = std::find(image_topics.begin(), image_topics.end(), topic);
+    if (found == image_topics.end()) {
+      return -1;
+    }
+    return static_cast<int>(std::distance(image_topics.begin(), found));
+  };
+
+  const auto is_image_topic = [&](const std::string& topic) -> bool {
+    return image_topic_index(topic) >= 0;
+  };
+
 
   glim_ros::MultiLidarMergerConfig multi_lidar_config;
   multi_lidar_config.enabled = config_ros.param<bool>("multi_lidar", "enabled", false);
@@ -261,7 +281,13 @@ int main(int argc, char** argv) {
 
   glim_ros::MultiLidarCloudMerger multi_lidar(multi_lidar_config);
 
-  std::vector<std::string> topics = {imu_topic, image_topic};
+  std::vector<std::string> topics = {imu_topic};
+
+  for (const auto& topic : image_topics) {
+    if (!topic.empty()) {
+      topics.push_back(topic);
+    }
+  }
 
   if (multi_lidar.enabled()) {
     topics.insert(topics.end(), multi_lidar.topics().begin(), multi_lidar.topics().end());
@@ -542,18 +568,44 @@ int main(int argc, char** argv) {
         }
       }
 #ifdef BUILD_WITH_CV_BRIDGE
-      else if (msg->topic_name == image_topic) {
+      else if (is_image_topic(msg->topic_name)) {
         if (topic_type == "sensor_msgs/msg/Image") {
           auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
           image_serialization.deserialize_message(&serialized_msg, image_msg.get());
-          glim->image_callback(image_msg);
+          {
+            const int camera_id = image_topic_index(msg->topic_name);
+            const std::string camera_name =
+              camera_id >= 0 && static_cast<size_t>(camera_id) < image_names.size() && !image_names[camera_id].empty()
+                ? image_names[camera_id]
+                : ("camera" + std::to_string(camera_id));
+
+            const std::string camera_frame =
+              camera_id >= 0 && static_cast<size_t>(camera_id) < image_frames.size()
+                ? image_frames[camera_id]
+                : "";
+
+            glim->camera_image_callback(image_msg, camera_id, camera_name, camera_frame);
+          }
         } else if (topic_type == "sensor_msgs/msg/CompressedImage") {
           auto compressed_image_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
           compressed_image_serialization.deserialize_message(&serialized_msg, compressed_image_msg.get());
 
           auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
           cv_bridge::toCvCopy(*compressed_image_msg, "bgr8")->toImageMsg(*image_msg);
-          glim->image_callback(image_msg);
+          {
+            const int camera_id = image_topic_index(msg->topic_name);
+            const std::string camera_name =
+              camera_id >= 0 && static_cast<size_t>(camera_id) < image_names.size() && !image_names[camera_id].empty()
+                ? image_names[camera_id]
+                : ("camera" + std::to_string(camera_id));
+
+            const std::string camera_frame =
+              camera_id >= 0 && static_cast<size_t>(camera_id) < image_frames.size()
+                ? image_frames[camera_id]
+                : "";
+
+            glim->camera_image_callback(image_msg, camera_id, camera_name, camera_frame);
+          }
         } else {
           spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/(Image|CompressedImage) (topic={})", topic_type, msg->topic_name);
           return false;

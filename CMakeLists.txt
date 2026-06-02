@@ -25,6 +25,7 @@ endif()
 
 if(BUILD_WITH_CV_BRIDGE)
   add_definitions(-DBUILD_WITH_CV_BRIDGE)
+  add_definitions(-DGLIM_USE_OPENCV)
 endif()
 
 if(BUILD_WITH_CUDA)

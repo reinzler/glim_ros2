@@ -387,7 +387,7 @@ void GlimROS::camera_image_callback(
     msg->header.stamp.sec,
     msg->header.stamp.nanosec);
 
-  const std::string frame_id = msg->header.frame_id.empty() ? default_frame_id : msg->header.frame_id;
+  const std::string frame_id = !default_frame_id.empty() ? default_frame_id : msg->header.frame_id;
 
   if (camera_id == 0 && !GlobalConfig::instance()->has_param("meta", "image_frame")) {
     spdlog::debug("auto-detecting primary image frame ID: {}", frame_id);
@@ -397,7 +397,6 @@ void GlimROS::camera_image_callback(
   auto cv_image = cv_bridge::toCvCopy(msg, "bgr8");
   const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
 
-#ifdef GLIM_USE_OPENCV
   auto image_ptr = std::make_shared<cv::Mat>(cv_image->image.clone());
 
   auto image_frame = std::make_shared<glim::CameraImageFrame>(
@@ -408,7 +407,6 @@ void GlimROS::camera_image_callback(
     image_ptr);
 
   glim::OdometryEstimationCallbacks::on_insert_image_frame(image_frame);
-#endif
 
   // Backward compatibility:
   // only primary camera enters the old single-camera GLIM image pipeline.
