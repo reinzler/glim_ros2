@@ -39,6 +39,7 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
+#include <glim_ros/multi_lidar_cloud_merger.hpp>
 #include <chrono>
 #include <future>
 #include <fstream>
@@ -199,10 +200,39 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     std::bind(&GlimROS::imu_callback, this, _1));
 
   qos = get_qos_settings(config_ros, "glim_ros", "points_qos");
-  points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    points_topic,
-    qos,
-    std::bind(&GlimROS::points_callback, this, _1));
+
+  glim_ros::MultiLidarMergerConfig multi_lidar_config;
+  multi_lidar_config.enabled = config_ros.param<bool>("multi_lidar", "enabled", false);
+  multi_lidar_config.target_frame = config_ros.param<std::string>("multi_lidar", "target_frame", "lidar");
+  multi_lidar_config.lidar_topics = config_ros.param<std::vector<std::string>>("multi_lidar", "lidar_topics", {});
+  multi_lidar_config.lidar_serials = config_ros.param<std::vector<std::string>>("multi_lidar", "lidar_serials", {});
+  multi_lidar_config.lidar_ids = config_ros.param<std::vector<int>>("multi_lidar", "lidar_ids", {});
+  multi_lidar_config.calibration_file = config_ros.param<std::string>("multi_lidar", "calibration_file", "");
+  multi_lidar_config.sync_tolerance_sec = config_ros.param<double>("multi_lidar", "sync_tolerance_sec", 0.03);
+  multi_lidar_config.allow_incomplete_lidar_group =
+    config_ros.param<bool>("multi_lidar", "allow_incomplete_lidar_group", false);
+  multi_lidar_config.max_cloud_buffer_size =
+    config_ros.param<int>("multi_lidar", "max_cloud_buffer_size", 50);
+
+  multi_lidar_merger.reset(new glim_ros::MultiLidarCloudMerger(multi_lidar_config));
+
+  if (multi_lidar_merger && multi_lidar_merger->enabled()) {
+    for (const auto& lidar_topic : multi_lidar_merger->topics()) {
+      spdlog::info("[multi_lidar] subscribe to {}", lidar_topic);
+
+      points_subs.emplace_back(this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        lidar_topic,
+        qos,
+        [this, lidar_topic](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          this->multi_lidar_points_callback(msg, lidar_topic);
+        }));
+    }
+  } else {
+    points_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      points_topic,
+      qos,
+      std::bind(&GlimROS::points_callback, this, _1));
+  }
 
 #ifdef BUILD_WITH_CV_BRIDGE
   qos = get_qos_settings(config_ros, "glim_ros", "image_qos");
@@ -396,6 +426,21 @@ void GlimROS::camera_image_callback(
 }
 
 #endif
+
+void GlimROS::multi_lidar_points_callback(
+  const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+  const std::string& topic) {
+  if (!msg || !multi_lidar_merger) {
+    return;
+  }
+
+  const auto merged_clouds = multi_lidar_merger->add_cloud(topic, msg);
+  for (const auto& merged_cloud : merged_clouds) {
+    if (merged_cloud) {
+      points_callback(merged_cloud);
+    }
+  }
+}
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);

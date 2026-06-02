@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <rclcpp/rclcpp.hpp>
+#include <glim_ros/multi_lidar_cloud_merger.hpp>
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -43,6 +44,10 @@ public:
 
 #endif
   size_t points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void multi_lidar_points_callback(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+    const std::string& topic);
+
 
   void wait(bool auto_quit = false);
   void save(const std::string& path);
@@ -73,6 +78,9 @@ private:
   rclcpp::TimerBase::SharedPtr timer;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr points_sub;
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> points_subs;
+  std::unique_ptr<glim_ros::MultiLidarCloudMerger> multi_lidar_merger;
+
 #ifdef BUILD_WITH_CV_BRIDGE
   image_transport::Subscriber image_sub;
   std::vector<image_transport::Subscriber> camera_image_subs;
