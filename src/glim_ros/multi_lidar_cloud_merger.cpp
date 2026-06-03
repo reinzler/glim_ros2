@@ -229,24 +229,26 @@ MultiLidarCloudMerger::MultiLidarCloudMerger(const MultiLidarMergerConfig& confi
     topic_to_index_[config_.lidar_topics[i]] = i;
   }
 
+  if (!enabled()) {
+    return;
+  }
+
   load_calibration();
 
-  if (enabled()) {
-    spdlog::info(
-      "[multi_lidar] enabled target_frame={} lidars={} sync_tol={} allow_incomplete={}",
-      config_.target_frame,
-      config_.lidar_topics.size(),
-      config_.sync_tolerance_sec,
-      config_.allow_incomplete_lidar_group);
+  spdlog::info(
+    "[multi_lidar] enabled target_frame={} lidars={} sync_tol={} allow_incomplete={}",
+    config_.target_frame,
+    config_.lidar_topics.size(),
+    config_.sync_tolerance_sec,
+    config_.allow_incomplete_lidar_group);
 
-    for (std::size_t i = 0; i < config_.lidar_topics.size(); i++) {
-      spdlog::info(
-        "[multi_lidar] lidar{} topic={} serial={} id={}",
-        i,
-        config_.lidar_topics[i],
-        config_.lidar_serials[i],
-        config_.lidar_ids[i]);
-    }
+  for (std::size_t i = 0; i < config_.lidar_topics.size(); i++) {
+    spdlog::info(
+      "[multi_lidar] lidar{} topic={} serial={} id={}",
+      i,
+      config_.lidar_topics[i],
+      config_.lidar_serials[i],
+      config_.lidar_ids[i]);
   }
 }
 
