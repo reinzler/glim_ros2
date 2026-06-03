@@ -24,8 +24,11 @@
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/bag_progress.hpp>
 #include <glim_ros/multi_lidar_cloud_merger.hpp>
+#include <glim_ros/rviz_viewer.hpp>
 #include <fstream>
 #include <algorithm>
+#include <rclcpp/generic_publisher.hpp>
+#include <unordered_set>
 
 class SpeedCounter {
 public:
@@ -241,6 +244,13 @@ int main(int argc, char** argv) {
   rclcpp::NodeOptions options;
   auto glim = std::make_shared<glim::GlimROS>(options);
 
+  // Built-in RViz/trajectory publisher for offline rosbag processing.
+  // Publishes /glim/odom-like private topics; for node name "glim_ros" this is /glim_ros/odom.
+  auto rviz_viewer = std::make_shared<glim::RvizViewer>();
+  rviz_viewer->create_subscriptions(*glim);
+  spdlog::info("[rviz_viewer] enabled for glim_rosbag");
+
+
   // List topics
   glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
 
@@ -278,6 +288,16 @@ int main(int argc, char** argv) {
   multi_lidar_config.sync_tolerance_sec = config_ros.param<double>("multi_lidar", "sync_tolerance_sec", 0.03);
   multi_lidar_config.allow_incomplete_lidar_group = config_ros.param<bool>("multi_lidar", "allow_incomplete_lidar_group", false);
   multi_lidar_config.max_cloud_buffer_size = config_ros.param<int>("multi_lidar", "max_cloud_buffer_size", 50);
+
+  const bool rosbag_republish_enabled = config_ros.param<bool>("rosbag_republish", "enabled", false);
+  const auto rosbag_republish_topics =
+    config_ros.param<std::vector<std::string>>("rosbag_republish", "topics", std::vector<std::string>());
+
+  std::unordered_set<std::string> rosbag_republish_topic_set(
+    rosbag_republish_topics.begin(),
+    rosbag_republish_topics.end());
+
+  std::unordered_map<std::string, rclcpp::GenericPublisher::SharedPtr> rosbag_republish_publishers;
 
   glim_ros::MultiLidarCloudMerger multi_lidar(multi_lidar_config);
 
@@ -508,6 +528,19 @@ int main(int argc, char** argv) {
       if (playback_until > 0.0 && msg_time / 1e9 > playback_until) {
         spdlog::info("reached playback_until ({} < {})", msg_time / 1e9, playback_until);
         return false;
+      }
+
+      if (rosbag_republish_enabled && rosbag_republish_topic_set.count(msg->topic_name) != 0) {
+        auto pub_it = rosbag_republish_publishers.find(msg->topic_name);
+        if (pub_it == rosbag_republish_publishers.end()) {
+          auto inserted = rosbag_republish_publishers.emplace(
+            msg->topic_name,
+            glim->create_generic_publisher(msg->topic_name, topic_type, rclcpp::QoS(100).reliable()));
+          pub_it = inserted.first;
+          spdlog::info("[rosbag_republish] enabled topic={} type={}", msg->topic_name, topic_type);
+        }
+
+        pub_it->second->publish(serialized_msg);
       }
 
       if (playback_duration > 0.0 && (msg_time - bag_t0) / 1e9 > playback_duration) {
