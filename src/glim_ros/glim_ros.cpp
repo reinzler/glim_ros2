@@ -488,6 +488,19 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   return workload;
 }
 
+
+size_t GlimROS::odometry_workload() {
+  return odometry_estimation ? odometry_estimation->workload() : 0;
+}
+
+size_t GlimROS::local_mapping_workload() {
+  return sub_mapping ? sub_mapping->workload() : 0;
+}
+
+size_t GlimROS::global_mapping_workload() {
+  return global_mapping ? global_mapping->workload() : 0;
+}
+
 bool GlimROS::needs_wait() {
   for (const auto& ext_module : extension_modules) {
     if (ext_module->needs_wait()) {

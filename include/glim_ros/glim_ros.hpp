@@ -54,6 +54,10 @@ public:
 
   const std::vector<std::shared_ptr<GenericTopicSubscription>>& extension_subscriptions();
 
+  size_t odometry_workload();
+  size_t local_mapping_workload();
+  size_t global_mapping_workload();
+
 private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;

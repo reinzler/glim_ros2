@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <rclcpp/generic_publisher.hpp>
 #include <unordered_set>
+#include <cstdlib>
+#include <optional>
 
 class SpeedCounter {
 public:
@@ -142,6 +144,22 @@ struct MemoryPauseConfig {
   double log_interval_sec = 5.0;
 };
 
+struct WorkloadPauseConfig {
+  bool enabled = true;
+  int check_interval_ms = 500;
+  double log_interval_sec = 5.0;
+
+  int odom_pause_high = 80;
+  int odom_resume_low = 20;
+
+  int local_mapping_pause_high = 120;
+  int local_mapping_resume_low = 40;
+
+  int global_mapping_pause_high = 20;
+  int global_mapping_resume_low = 5;
+};
+
+
 bool read_meminfo_kb(long long& mem_total_kb, long long& mem_available_kb) {
   std::ifstream ifs("/proc/meminfo");
   if (!ifs) {
@@ -181,6 +199,99 @@ double system_memory_usage_ratio() {
   const double used = static_cast<double>(total_kb - available_kb);
   return std::clamp(used / static_cast<double>(total_kb), 0.0, 1.0);
 }
+
+
+struct OpenMPRuntimeConfig {
+  bool enabled = true;
+  bool override_existing_env = true;
+
+  int num_threads = 8;
+  bool dynamic = false;
+  int max_active_levels = 1;
+
+  std::string proc_bind = "close";
+  std::string places = "cores";
+  std::string schedule = "";
+
+  bool display_env = false;
+
+  int openblas_num_threads = 1;
+  int mkl_num_threads = 1;
+  int numexpr_num_threads = 1;
+};
+
+void set_env_configured(
+  const std::string& key,
+  const std::string& value,
+  bool override_existing_env) {
+  if (value.empty()) {
+    return;
+  }
+
+  const char* old_value = std::getenv(key.c_str());
+  if (old_value && !override_existing_env) {
+    spdlog::info("[thread_cfg] keep existing {}={}", key, old_value);
+    return;
+  }
+
+  setenv(key.c_str(), value.c_str(), 1);
+  spdlog::info("[thread_cfg] set {}={}", key, value);
+}
+
+void apply_openmp_runtime_config(const OpenMPRuntimeConfig& cfg) {
+  if (!cfg.enabled) {
+    spdlog::info("[thread_cfg] OpenMP runtime config disabled");
+    return;
+  }
+
+  if (cfg.num_threads > 0) {
+    set_env_configured("OMP_NUM_THREADS", std::to_string(cfg.num_threads), cfg.override_existing_env);
+  }
+
+  set_env_configured("OMP_DYNAMIC", cfg.dynamic ? "TRUE" : "FALSE", cfg.override_existing_env);
+
+  if (cfg.max_active_levels > 0) {
+    set_env_configured("OMP_MAX_ACTIVE_LEVELS", std::to_string(cfg.max_active_levels), cfg.override_existing_env);
+  }
+
+  if (!cfg.proc_bind.empty()) {
+    set_env_configured("OMP_PROC_BIND", cfg.proc_bind, cfg.override_existing_env);
+  }
+
+  if (!cfg.places.empty()) {
+    set_env_configured("OMP_PLACES", cfg.places, cfg.override_existing_env);
+  }
+
+  if (!cfg.schedule.empty()) {
+    set_env_configured("OMP_SCHEDULE", cfg.schedule, cfg.override_existing_env);
+  }
+
+  set_env_configured("OMP_DISPLAY_ENV", cfg.display_env ? "TRUE" : "FALSE", cfg.override_existing_env);
+
+  if (cfg.openblas_num_threads > 0) {
+    set_env_configured("OPENBLAS_NUM_THREADS", std::to_string(cfg.openblas_num_threads), cfg.override_existing_env);
+  }
+
+  if (cfg.mkl_num_threads > 0) {
+    set_env_configured("MKL_NUM_THREADS", std::to_string(cfg.mkl_num_threads), cfg.override_existing_env);
+  }
+
+  if (cfg.numexpr_num_threads > 0) {
+    set_env_configured("NUMEXPR_NUM_THREADS", std::to_string(cfg.numexpr_num_threads), cfg.override_existing_env);
+  }
+
+  spdlog::info(
+    "[thread_cfg] effective env OMP_NUM_THREADS={} OMP_DYNAMIC={} OMP_PROC_BIND={} OMP_PLACES={} "
+    "OMP_MAX_ACTIVE_LEVELS={} OPENBLAS_NUM_THREADS={} MKL_NUM_THREADS={}",
+    std::getenv("OMP_NUM_THREADS") ? std::getenv("OMP_NUM_THREADS") : "",
+    std::getenv("OMP_DYNAMIC") ? std::getenv("OMP_DYNAMIC") : "",
+    std::getenv("OMP_PROC_BIND") ? std::getenv("OMP_PROC_BIND") : "",
+    std::getenv("OMP_PLACES") ? std::getenv("OMP_PLACES") : "",
+    std::getenv("OMP_MAX_ACTIVE_LEVELS") ? std::getenv("OMP_MAX_ACTIVE_LEVELS") : "",
+    std::getenv("OPENBLAS_NUM_THREADS") ? std::getenv("OPENBLAS_NUM_THREADS") : "",
+    std::getenv("MKL_NUM_THREADS") ? std::getenv("MKL_NUM_THREADS") : "");
+}
+
 
 void wait_for_memory_if_needed(
   const MemoryPauseConfig& cfg,
@@ -231,6 +342,107 @@ void wait_for_memory_if_needed(
     std::this_thread::sleep_for(std::chrono::milliseconds(cfg.check_interval_ms));
   }
 }
+
+
+void wait_for_workload_if_needed(
+  const WorkloadPauseConfig& cfg,
+  const std::shared_ptr<glim::GlimROS>& glim) {
+  if (!cfg.enabled) {
+    return;
+  }
+
+  auto get_odom = [&]() -> size_t { return glim ? glim->odometry_workload() : 0; };
+  auto get_local = [&]() -> size_t { return glim ? glim->local_mapping_workload() : 0; };
+  auto get_global = [&]() -> size_t { return glim ? glim->global_mapping_workload() : 0; };
+
+  auto high_exceeded = [&](size_t odom, size_t local, size_t global, std::string& reason) -> bool {
+    if (cfg.odom_pause_high > 0 && odom >= static_cast<size_t>(cfg.odom_pause_high)) {
+      reason = fmt::format("odometry={} >= {}", odom, cfg.odom_pause_high);
+      return true;
+    }
+    if (cfg.local_mapping_pause_high > 0 && local >= static_cast<size_t>(cfg.local_mapping_pause_high)) {
+      reason = fmt::format("local_mapping={} >= {}", local, cfg.local_mapping_pause_high);
+      return true;
+    }
+    if (cfg.global_mapping_pause_high > 0 && global >= static_cast<size_t>(cfg.global_mapping_pause_high)) {
+      reason = fmt::format("global_mapping={} >= {}", global, cfg.global_mapping_pause_high);
+      return true;
+    }
+    return false;
+  };
+
+  auto all_below_resume = [&](size_t odom, size_t local, size_t global) -> bool {
+    const bool odom_ok =
+      cfg.odom_pause_high <= 0 || odom <= static_cast<size_t>(cfg.odom_resume_low);
+    const bool local_ok =
+      cfg.local_mapping_pause_high <= 0 || local <= static_cast<size_t>(cfg.local_mapping_resume_low);
+    const bool global_ok =
+      cfg.global_mapping_pause_high <= 0 || global <= static_cast<size_t>(cfg.global_mapping_resume_low);
+    return odom_ok && local_ok && global_ok;
+  };
+
+  size_t odom = get_odom();
+  size_t local = get_local();
+  size_t global = get_global();
+
+  std::string reason;
+  if (!high_exceeded(odom, local, global, reason)) {
+    return;
+  }
+
+  spdlog::warn(
+    "[workload_guard] pausing rosbag reading: {} workloads odom={} local={} global={}",
+    reason,
+    odom,
+    local,
+    global);
+
+  auto last_log = std::chrono::steady_clock::now();
+
+  while (rclcpp::ok()) {
+    rclcpp::spin_some(glim);
+
+    // Let GLIM drain queued work while no new bag messages are fed.
+    glim->timer_callback();
+
+    odom = get_odom();
+    local = get_local();
+    global = get_global();
+
+    if (all_below_resume(odom, local, global)) {
+      spdlog::warn(
+        "[workload_guard] resuming rosbag reading: workloads odom={} local={} global={} "
+        "resume_low odom={} local={} global={}",
+        odom,
+        local,
+        global,
+        cfg.odom_resume_low,
+        cfg.local_mapping_resume_low,
+        cfg.global_mapping_resume_low);
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log).count();
+
+    if (elapsed >= cfg.log_interval_sec) {
+      spdlog::warn(
+        "[workload_guard] still paused: workloads odom={} local={} global={} "
+        "resume_low odom={} local={} global={}",
+        odom,
+        local,
+        global,
+        cfg.odom_resume_low,
+        cfg.local_mapping_resume_low,
+        cfg.global_mapping_resume_low);
+      last_log = now;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(cfg.check_interval_ms));
+  }
+}
+
 
 }  // namespace
 
@@ -434,6 +646,132 @@ int main(int argc, char** argv) {
     memory_pause_cfg.check_interval_ms);
 
 
+  // Runtime threading / OpenMP configuration.
+  // This is applied before bag playback and before gtsam_points VGICP factors start heavy OpenMP regions.
+  OpenMPRuntimeConfig openmp_runtime_cfg;
+  openmp_runtime_cfg.enabled =
+    config_ros.param<bool>("openmp", "enabled", openmp_runtime_cfg.enabled);
+  openmp_runtime_cfg.override_existing_env =
+    config_ros.param<bool>("openmp", "override_existing_env", openmp_runtime_cfg.override_existing_env);
+
+  openmp_runtime_cfg.num_threads =
+    config_ros.param<int>("openmp", "num_threads", openmp_runtime_cfg.num_threads);
+  openmp_runtime_cfg.dynamic =
+    config_ros.param<bool>("openmp", "dynamic", openmp_runtime_cfg.dynamic);
+  openmp_runtime_cfg.max_active_levels =
+    config_ros.param<int>("openmp", "max_active_levels", openmp_runtime_cfg.max_active_levels);
+
+  openmp_runtime_cfg.proc_bind =
+    config_ros.param<std::string>("openmp", "proc_bind", openmp_runtime_cfg.proc_bind);
+  openmp_runtime_cfg.places =
+    config_ros.param<std::string>("openmp", "places", openmp_runtime_cfg.places);
+  openmp_runtime_cfg.schedule =
+    config_ros.param<std::string>("openmp", "schedule", openmp_runtime_cfg.schedule);
+
+  openmp_runtime_cfg.display_env =
+    config_ros.param<bool>("openmp", "display_env", openmp_runtime_cfg.display_env);
+
+  openmp_runtime_cfg.openblas_num_threads =
+    config_ros.param<int>("openmp", "openblas_num_threads", openmp_runtime_cfg.openblas_num_threads);
+  openmp_runtime_cfg.mkl_num_threads =
+    config_ros.param<int>("openmp", "mkl_num_threads", openmp_runtime_cfg.mkl_num_threads);
+  openmp_runtime_cfg.numexpr_num_threads =
+    config_ros.param<int>("openmp", "numexpr_num_threads", openmp_runtime_cfg.numexpr_num_threads);
+
+  glim->declare_parameter("glim_rosbag/openmp_enabled", openmp_runtime_cfg.enabled);
+  glim->declare_parameter("glim_rosbag/openmp_override_existing_env", openmp_runtime_cfg.override_existing_env);
+  glim->declare_parameter("glim_rosbag/openmp_num_threads", openmp_runtime_cfg.num_threads);
+  glim->declare_parameter("glim_rosbag/openmp_dynamic", openmp_runtime_cfg.dynamic);
+  glim->declare_parameter("glim_rosbag/openmp_max_active_levels", openmp_runtime_cfg.max_active_levels);
+  glim->declare_parameter("glim_rosbag/openmp_proc_bind", openmp_runtime_cfg.proc_bind);
+  glim->declare_parameter("glim_rosbag/openmp_places", openmp_runtime_cfg.places);
+  glim->declare_parameter("glim_rosbag/openmp_schedule", openmp_runtime_cfg.schedule);
+  glim->declare_parameter("glim_rosbag/openmp_display_env", openmp_runtime_cfg.display_env);
+  glim->declare_parameter("glim_rosbag/openblas_num_threads", openmp_runtime_cfg.openblas_num_threads);
+  glim->declare_parameter("glim_rosbag/mkl_num_threads", openmp_runtime_cfg.mkl_num_threads);
+  glim->declare_parameter("glim_rosbag/numexpr_num_threads", openmp_runtime_cfg.numexpr_num_threads);
+
+  glim->get_parameter("glim_rosbag/openmp_enabled", openmp_runtime_cfg.enabled);
+  glim->get_parameter("glim_rosbag/openmp_override_existing_env", openmp_runtime_cfg.override_existing_env);
+  glim->get_parameter("glim_rosbag/openmp_num_threads", openmp_runtime_cfg.num_threads);
+  glim->get_parameter("glim_rosbag/openmp_dynamic", openmp_runtime_cfg.dynamic);
+  glim->get_parameter("glim_rosbag/openmp_max_active_levels", openmp_runtime_cfg.max_active_levels);
+  glim->get_parameter("glim_rosbag/openmp_proc_bind", openmp_runtime_cfg.proc_bind);
+  glim->get_parameter("glim_rosbag/openmp_places", openmp_runtime_cfg.places);
+  glim->get_parameter("glim_rosbag/openmp_schedule", openmp_runtime_cfg.schedule);
+  glim->get_parameter("glim_rosbag/openmp_display_env", openmp_runtime_cfg.display_env);
+  glim->get_parameter("glim_rosbag/openblas_num_threads", openmp_runtime_cfg.openblas_num_threads);
+  glim->get_parameter("glim_rosbag/mkl_num_threads", openmp_runtime_cfg.mkl_num_threads);
+  glim->get_parameter("glim_rosbag/numexpr_num_threads", openmp_runtime_cfg.numexpr_num_threads);
+
+  apply_openmp_runtime_config(openmp_runtime_cfg);
+
+
+
+  // Workload guard for UAV/offline processing.
+  WorkloadPauseConfig workload_pause_cfg;
+
+  workload_pause_cfg.enabled =
+    config_ros.param<bool>("glim_rosbag", "workload_pause_enabled", workload_pause_cfg.enabled);
+  workload_pause_cfg.check_interval_ms =
+    config_ros.param<int>("glim_rosbag", "workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
+  workload_pause_cfg.log_interval_sec =
+    config_ros.param<double>("glim_rosbag", "workload_pause_log_interval_sec", workload_pause_cfg.log_interval_sec);
+
+  workload_pause_cfg.odom_pause_high =
+    config_ros.param<int>("glim_rosbag", "odom_pause_high", workload_pause_cfg.odom_pause_high);
+  workload_pause_cfg.odom_resume_low =
+    config_ros.param<int>("glim_rosbag", "odom_resume_low", workload_pause_cfg.odom_resume_low);
+
+  workload_pause_cfg.local_mapping_pause_high =
+    config_ros.param<int>("glim_rosbag", "local_mapping_pause_high", workload_pause_cfg.local_mapping_pause_high);
+  workload_pause_cfg.local_mapping_resume_low =
+    config_ros.param<int>("glim_rosbag", "local_mapping_resume_low", workload_pause_cfg.local_mapping_resume_low);
+
+  workload_pause_cfg.global_mapping_pause_high =
+    config_ros.param<int>("glim_rosbag", "global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
+  workload_pause_cfg.global_mapping_resume_low =
+    config_ros.param<int>("glim_rosbag", "global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+
+  glim->declare_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
+  glim->declare_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
+  glim->declare_parameter("glim_rosbag/workload_pause_log_interval_sec", workload_pause_cfg.log_interval_sec);
+
+  glim->declare_parameter("glim_rosbag/odom_pause_high", workload_pause_cfg.odom_pause_high);
+  glim->declare_parameter("glim_rosbag/odom_resume_low", workload_pause_cfg.odom_resume_low);
+
+  glim->declare_parameter("glim_rosbag/local_mapping_pause_high", workload_pause_cfg.local_mapping_pause_high);
+  glim->declare_parameter("glim_rosbag/local_mapping_resume_low", workload_pause_cfg.local_mapping_resume_low);
+
+  glim->declare_parameter("glim_rosbag/global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
+  glim->declare_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+
+  glim->get_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
+  glim->get_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
+  glim->get_parameter("glim_rosbag/workload_pause_log_interval_sec", workload_pause_cfg.log_interval_sec);
+
+  glim->get_parameter("glim_rosbag/odom_pause_high", workload_pause_cfg.odom_pause_high);
+  glim->get_parameter("glim_rosbag/odom_resume_low", workload_pause_cfg.odom_resume_low);
+
+  glim->get_parameter("glim_rosbag/local_mapping_pause_high", workload_pause_cfg.local_mapping_pause_high);
+  glim->get_parameter("glim_rosbag/local_mapping_resume_low", workload_pause_cfg.local_mapping_resume_low);
+
+  glim->get_parameter("glim_rosbag/global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
+  glim->get_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+
+  spdlog::info(
+    "[workload_guard] enabled={} check={}ms odom={}/{} local={}/{} global={}/{}",
+    workload_pause_cfg.enabled,
+    workload_pause_cfg.check_interval_ms,
+    workload_pause_cfg.odom_pause_high,
+    workload_pause_cfg.odom_resume_low,
+    workload_pause_cfg.local_mapping_pause_high,
+    workload_pause_cfg.local_mapping_resume_low,
+    workload_pause_cfg.global_mapping_pause_high,
+    workload_pause_cfg.global_mapping_resume_low);
+
+
+
   // Bag read function
   const auto read_bag = [&](const std::string& bag_filename) {
     spdlog::info("opening {}", bag_filename);
@@ -499,6 +837,7 @@ int main(int argc, char** argv) {
       }
       rclcpp::spin_some(glim);
 
+      wait_for_workload_if_needed(workload_pause_cfg, glim);
       wait_for_memory_if_needed(memory_pause_cfg, glim);
       const auto msg = reader.read_next();
       const std::string topic_type = topic_type_map[msg->topic_name];
