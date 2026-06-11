@@ -281,6 +281,15 @@ void MultiLidarCloudMerger::load_calibration() {
     }
 
     T_target_lidar_[i] = matrix_from_json_calibration(j.at("calibration").at(serial));
+
+    const auto& T = T_target_lidar_[i].matrix();
+    spdlog::info(
+      "[multi_lidar] calibration serial={} T_target_lidar=rowmajor=[{:.6f} {:.6f} {:.6f} {:.6f}; {:.6f} {:.6f} {:.6f} {:.6f}; {:.6f} {:.6f} {:.6f} {:.6f}; {:.6f} {:.6f} {:.6f} {:.6f}]",
+      serial,
+      T(0,0), T(0,1), T(0,2), T(0,3),
+      T(1,0), T(1,1), T(1,2), T(1,3),
+      T(2,0), T(2,1), T(2,2), T(2,3),
+      T(3,0), T(3,1), T(3,2), T(3,3));
   }
 }
 
@@ -595,6 +604,60 @@ MultiLidarCloudMerger::build_msg(
     std::memcpy(out->data.data() + base + 16, &t_nsec, sizeof(std::uint32_t));
     std::memcpy(out->data.data() + base + 20, &p.line, sizeof(std::uint16_t));
     std::memcpy(out->data.data() + base + 22, &p.scanner_id, sizeof(std::uint8_t));
+  }
+
+  {
+    static bool debug_written = false;
+
+    if (!debug_written) {
+      debug_written = true;
+
+      const std::string debug_path = "/tmp/glim_multilidar_merged_debug.ply";
+      std::ofstream ofs(debug_path);
+
+      if (ofs) {
+        ofs << "ply\n";
+        ofs << "format ascii 1.0\n";
+        ofs << "element vertex " << points.size() << "\n";
+        ofs << "property float x\n";
+        ofs << "property float y\n";
+        ofs << "property float z\n";
+        ofs << "property uchar red\n";
+        ofs << "property uchar green\n";
+        ofs << "property uchar blue\n";
+        ofs << "end_header\n";
+
+        for (const auto& p : points) {
+          int r = 255;
+          int g = 255;
+          int b = 255;
+
+          if (p.scanner_id == 0) {
+            r = 0;
+            g = 255;
+            b = 0;
+          } else if (p.scanner_id == 1) {
+            r = 255;
+            g = 0;
+            b = 0;
+          }
+
+          ofs << p.x << " "
+              << p.y << " "
+              << p.z << " "
+              << r << " "
+              << g << " "
+              << b << "\n";
+        }
+
+        spdlog::warn(
+          "[multi_lidar] wrote debug merged PLY: {} points={} front_green/back_red",
+          debug_path,
+          points.size());
+      } else {
+        spdlog::warn("[multi_lidar] failed to write debug merged PLY");
+      }
+    }
   }
 
   return out;

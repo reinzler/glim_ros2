@@ -104,6 +104,51 @@ private:
 
 namespace {
 
+
+std::string infer_storage_id_from_uri(const std::string& uri) {
+  const std::filesystem::path path(uri);
+
+  if (std::filesystem::is_regular_file(path)) {
+    const auto ext = path.extension().string();
+
+    if (ext == ".mcap") {
+      return "mcap";
+    }
+    if (ext == ".db3" || ext == ".sqlite3") {
+      return "sqlite3";
+    }
+  }
+
+  if (std::filesystem::is_directory(path)) {
+    bool has_mcap = false;
+    bool has_db3 = false;
+
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+
+      const auto ext = entry.path().extension().string();
+
+      if (ext == ".mcap") {
+        has_mcap = true;
+      } else if (ext == ".db3" || ext == ".sqlite3") {
+        has_db3 = true;
+      }
+    }
+
+    if (has_mcap) {
+      return "mcap";
+    }
+    if (has_db3) {
+      return "sqlite3";
+    }
+  }
+
+  return "sqlite3";
+}
+
+
 std::unordered_map<std::string, std::size_t> topic_message_counts_from_metadata(
     const rosbag2_storage::BagMetadata& metadata,
     const std::vector<std::string>& selected_topics) {
@@ -788,14 +833,21 @@ int main(int argc, char** argv) {
         options.storage_id = metadata.storage_identifier;
 
         if (options.storage_id.empty()) {
-          spdlog::warn("storage_identifier not found in metadata.yaml (uri={}), fallback to sqlite3", bag_filename);
-          options.storage_id = "sqlite3";
+          options.storage_id = infer_storage_id_from_uri(bag_filename);
+          spdlog::warn(
+            "storage_identifier not found in metadata.yaml (uri={}), inferred storage_id={} from bag files",
+            bag_filename,
+            options.storage_id);
         } else {
           spdlog::info("detected storage_id={} from metadata.yaml", options.storage_id);
         }
       } catch (const std::exception& e) {
-        spdlog::warn("failed to read metadata.yaml (uri={}): {} (fallback to sqlite3)", bag_filename, e.what());
-        options.storage_id = "sqlite3";
+        options.storage_id = infer_storage_id_from_uri(bag_filename);
+        spdlog::warn(
+          "failed to read metadata.yaml (uri={}): {} (inferred storage_id={})",
+          bag_filename,
+          e.what(),
+          options.storage_id);
       }
     } else {
       options.storage_id = "sqlite3";
