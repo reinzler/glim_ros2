@@ -104,4 +104,22 @@ if(BUILD_WITH_VIEWER)
   )
 endif()
 
+if(BUILD_TESTING)
+  include(CTest)
+
+  ament_auto_add_executable(test_multi_lidar_time_contract
+    test/test_multi_lidar_time_contract.cpp
+  )
+  target_link_libraries(test_multi_lidar_time_contract
+    glim_ros
+    glim::glim
+  )
+  target_compile_definitions(test_multi_lidar_time_contract PRIVATE GLIM_ROS2)
+
+  add_test(
+    NAME test_multi_lidar_time_contract
+    COMMAND test_multi_lidar_time_contract
+  )
+endif()
+
 ament_auto_package()

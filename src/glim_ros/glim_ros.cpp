@@ -47,6 +47,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace glim {
 
@@ -94,6 +95,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   imu_time_offset = config_ros.param<double>("glim_ros", "imu_time_offset", 0.0);
   points_time_offset = config_ros.param<double>("glim_ros", "points_time_offset", 0.0);
   acc_scale = config_ros.param<double>("glim_ros", "acc_scale", 0.0);
+  stamp_filter_min_sec =
+    config_ros.param<double>("stamp_filter", "min_sec", -std::numeric_limits<double>::infinity());
+  stamp_filter_max_sec =
+    config_ros.param<double>("stamp_filter", "max_sec", std::numeric_limits<double>::infinity());
 
   glim::Config config_sensors(glim::GlobalConfig::get_config_path("config_sensors"));
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
@@ -213,6 +218,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     config_ros.param<bool>("multi_lidar", "allow_incomplete_lidar_group", false);
   multi_lidar_config.max_cloud_buffer_size =
     config_ros.param<int>("multi_lidar", "max_cloud_buffer_size", 50);
+  multi_lidar_config.wait_for_imu =
+    config_ros.param<bool>("multi_lidar", "wait_for_imu", true);
+  multi_lidar_config.stamp_filter_min_sec = stamp_filter_min_sec;
+  multi_lidar_config.stamp_filter_max_sec = stamp_filter_max_sec;
 
   multi_lidar_merger.reset(new glim_ros::MultiLidarCloudMerger(multi_lidar_config));
 
@@ -327,8 +336,40 @@ const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension
   return extension_subs;
 }
 
+bool GlimROS::accept_stamp(const double stamp, const char* source) const {
+  if (!std::isfinite(stamp)) {
+    static int nonfinite_warn_count = 0;
+    if (nonfinite_warn_count < 20) {
+      nonfinite_warn_count++;
+      spdlog::warn("[stamp_filter] drop {} non-finite stamp={}", source, stamp);
+    }
+    return false;
+  }
+
+  if (stamp < stamp_filter_min_sec || stamp > stamp_filter_max_sec) {
+    static int range_warn_count = 0;
+    if (range_warn_count < 50) {
+      range_warn_count++;
+      spdlog::warn(
+        "[stamp_filter] drop {} stamp={:.9f} allowed=[{:.9f},{:.9f}]",
+        source,
+        stamp,
+        stamp_filter_min_sec,
+        stamp_filter_max_sec);
+    }
+    return false;
+  }
+
+  return true;
+}
+
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   spdlog::trace("IMU: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+  const double imu_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + imu_time_offset;
+  if (!accept_stamp(imu_stamp, "imu")) {
+    return;
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "imu_frame_id")) {
     spdlog::debug("auto-detecting IMU frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "imu_frame_id", msg->header.frame_id);
@@ -348,7 +389,6 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
     }
   }
 
-  const double imu_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + imu_time_offset;
   const Eigen::Vector3d linear_acc = acc_scale * Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
   const Eigen::Vector3d angular_vel(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
 
@@ -358,6 +398,12 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   }
 
   odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
+  if (multi_lidar_merger && multi_lidar_merger->enabled()) {
+    multi_lidar_merger->notify_imu(imu_stamp);
+    for (const auto& merged_cloud : multi_lidar_merger->flush_ready_merges()) {
+      points_callback(merged_cloud);
+    }
+  }
   if (sub_mapping) {
     sub_mapping->insert_imu(imu_stamp, linear_acc, angular_vel);
   }
@@ -432,6 +478,11 @@ void GlimROS::multi_lidar_points_callback(
     return;
   }
 
+  const double stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+  if (!accept_stamp(stamp, "multi_lidar_cloud")) {
+    return;
+  }
+
   const auto merged_clouds = multi_lidar_merger->add_cloud(topic, msg);
   for (const auto& merged_cloud : merged_clouds) {
     if (merged_cloud) {
@@ -442,6 +493,11 @@ void GlimROS::multi_lidar_points_callback(
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+  const double point_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9 + points_time_offset;
+  if (!accept_stamp(point_stamp, "points")) {
+    return 0;
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
@@ -460,11 +516,43 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
     return 0;
   }
 
+  const auto log_raw_time_stats =
+    [](const char* stage, const std::string& frame_id, const glim::RawPoints::Ptr& points) {
+      static int log_count = 0;
+      if (!points || log_count >= 20) {
+        return;
+      }
+      log_count++;
+
+      if (points->times.empty()) {
+        spdlog::info(
+          "[points_time] {} frame={} stamp={:.9f} points={} times=<empty>",
+          stage,
+          frame_id,
+          points->stamp,
+          points->size());
+        return;
+      }
+
+      const auto minmax = std::minmax_element(points->times.begin(), points->times.end());
+      spdlog::info(
+        "[points_time] {} frame={} stamp={:.9f} points={} times=[{:.9f},{:.9f}] scan_end={:.9f}",
+        stage,
+        frame_id,
+        points->stamp,
+        points->size(),
+        *minmax.first,
+        *minmax.second,
+        points->stamp + *minmax.second);
+    };
+
   raw_points->stamp += points_time_offset;
+  log_raw_time_stats("before_timekeeper", msg->header.frame_id, raw_points);
   if (!time_keeper->process(raw_points)) {
     spdlog::warn("skip an invalid point cloud (stamp={})", raw_points->stamp);
     return 0;
   }
+  log_raw_time_stats("after_timekeeper", msg->header.frame_id, raw_points);
   auto preprocessed = preprocessor->preprocess(raw_points);
   if (!preprocessed) {
     spdlog::warn(

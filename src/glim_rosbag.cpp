@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iostream>
 #include <future>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <spdlog/spdlog.h>
@@ -545,6 +546,11 @@ int main(int argc, char** argv) {
   multi_lidar_config.sync_tolerance_sec = config_ros.param<double>("multi_lidar", "sync_tolerance_sec", 0.03);
   multi_lidar_config.allow_incomplete_lidar_group = config_ros.param<bool>("multi_lidar", "allow_incomplete_lidar_group", false);
   multi_lidar_config.max_cloud_buffer_size = config_ros.param<int>("multi_lidar", "max_cloud_buffer_size", 50);
+  multi_lidar_config.wait_for_imu = config_ros.param<bool>("multi_lidar", "wait_for_imu", true);
+  multi_lidar_config.stamp_filter_min_sec =
+    config_ros.param<double>("stamp_filter", "min_sec", -std::numeric_limits<double>::infinity());
+  multi_lidar_config.stamp_filter_max_sec =
+    config_ros.param<double>("stamp_filter", "max_sec", std::numeric_limits<double>::infinity());
 
   const bool rosbag_republish_enabled = config_ros.param<bool>("rosbag_republish", "enabled", false);
   const auto rosbag_republish_topics =
@@ -818,8 +824,11 @@ int main(int argc, char** argv) {
 
 
   // Bag read function
+  bool bag_truncated = false;   // set true if a bag ends early due to a read error
   const auto read_bag = [&](const std::string& bag_filename) {
     spdlog::info("opening {}", bag_filename);
+    size_t messages_read = 0;
+    bag_truncated = false;
     rosbag2_storage::StorageOptions options;
     options.uri = bag_filename;
 
@@ -891,7 +900,27 @@ int main(int argc, char** argv) {
 
       wait_for_workload_if_needed(workload_pause_cfg, glim);
       wait_for_memory_if_needed(memory_pause_cfg, glim);
-      const auto msg = reader.read_next();
+
+      // A truncated/corrupt rosbag makes the storage layer throw HERE
+      // (e.g. rosbag2_storage_plugins::SqliteException
+      //  "database disk image is malformed"). Without this catch the exception
+      // unwinds out of main -> std::terminate -> the drain+save below is never
+      // reached and the whole map/dump is lost. Instead we treat a read error
+      // as a clean end-of-bag: stop reading and fall through to drain+save so
+      // everything built so far is written out.
+      rosbag2_storage::SerializedBagMessageSharedPtr msg;
+      try {
+        msg = reader.read_next();
+      } catch (const std::exception& e) {
+        spdlog::warn(
+          "[bag] read error after {} messages ({}): treating truncated bag as "
+          "end-of-bag; the map/dump built so far WILL be saved",
+          messages_read,
+          e.what());
+        bag_truncated = true;
+        break;  // leave while(has_next) -> return true below -> save runs
+      }
+      ++messages_read;
       const std::string topic_type = topic_type_map[msg->topic_name];
       const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
 
@@ -970,6 +999,25 @@ int main(int argc, char** argv) {
         auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
         imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
         glim->imu_callback(imu_msg);
+        if (multi_lidar.enabled()) {
+          const double imu_stamp =
+            imu_msg->header.stamp.sec + imu_msg->header.stamp.nanosec * 1e-9;
+          multi_lidar.notify_imu(imu_stamp);
+          for (const auto& merged_cloud : multi_lidar.flush_ready_merges()) {
+            const size_t workload = glim->points_callback(merged_cloud);
+            const double cloud_stamp =
+              merged_cloud->header.stamp.sec + merged_cloud->header.stamp.nanosec * 1e-9;
+            if (cloud_stamp > end_time) {
+              spdlog::info("end_time reached");
+              return false;
+            }
+            if (workload > 5) {
+              const size_t sleep_msec = (workload - 4) * 5;
+              spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+              std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+            }
+          }
+        }
       } else if (((!multi_lidar.enabled() && msg->topic_name == points_topic) || (multi_lidar.enabled() && multi_lidar.is_lidar_topic(msg->topic_name)))) {
         if (topic_type != "sensor_msgs/msg/PointCloud2") {
           spdlog::error("topic_type mismatch: {} != sensor_msgs/msg/PointCloud2 (topic={})", topic_type, msg->topic_name);
@@ -977,18 +1025,36 @@ int main(int argc, char** argv) {
         }
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
-        const size_t workload = glim->points_callback(points_msg);
 
-        if (points_msg->header.stamp.sec + points_msg->header.stamp.nanosec * 1e-9 > end_time) {
-          spdlog::info("end_time reached");
+        const auto process_points = [&](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud) {
+          const size_t workload = glim->points_callback(cloud);
+
+          const double cloud_stamp =
+            cloud->header.stamp.sec + cloud->header.stamp.nanosec * 1e-9;
+          if (cloud_stamp > end_time) {
+            spdlog::info("end_time reached");
+            return false;
+          }
+
+          if (workload > 5) {
+            // Odometry estimation is behind
+            const size_t sleep_msec = (workload - 4) * 5;
+            spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
+          }
+
+          return true;
+        };
+
+        if (multi_lidar.enabled()) {
+          const auto merged_clouds = multi_lidar.add_cloud(msg->topic_name, points_msg);
+          for (const auto& merged_cloud : merged_clouds) {
+            if (!process_points(merged_cloud)) {
+              return false;
+            }
+          }
+        } else if (!process_points(points_msg)) {
           return false;
-        }
-
-        if (workload > 5) {
-          // Odometry estimation is behind
-          const size_t sleep_msec = (workload - 4) * 5;
-          spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
-          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
         }
       }
 #ifdef BUILD_WITH_CV_BRIDGE
@@ -1072,11 +1138,23 @@ int main(int argc, char** argv) {
   glim->declare_parameter<std::string>("dump_path", dump_path);
   glim->get_parameter<std::string>("dump_path", dump_path);
 
-  for (const auto& bag_filename : bag_filenames) {
-    if (!read_bag(bag_filename)) {
-      auto_quit = true;
-      break;
+  try {
+    for (const auto& bag_filename : bag_filenames) {
+      if (!read_bag(bag_filename)) {
+        auto_quit = true;
+        break;
+      }
     }
+  } catch (const std::exception& e) {
+    // Last-resort net for anything that escaped read_bag (storage/deserialize/
+    // etc). Do NOT rethrow: fall through to the drain+save below so the partial
+    // map is preserved instead of lost to std::terminate.
+    spdlog::error("[bag] unhandled exception during playback ({}); saving partial map", e.what());
+    auto_quit = true;
+  }
+
+  if (bag_truncated) {
+    spdlog::warn("[bag] one or more bags were truncated; saved map reflects data up to the truncation point");
   }
 
   if (!auto_quit) {
@@ -1091,8 +1169,38 @@ int main(int argc, char** argv) {
       glim->wait(auto_quit);
     });
 
-    while (wait_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
-      glim_ros::BagProgress::drain_log("glim_wait", drain_start);
+    // Snapshot the backlog at drain start so we can render a 0..100% bar as the
+    // queued odometry/local/global work is consumed.
+    const auto backlog_now = [&]() -> size_t {
+      return glim->odometry_workload() + glim->local_mapping_workload() +
+             glim->global_mapping_workload();
+    };
+    const size_t backlog0 = std::max<size_t>(backlog_now(), 1);
+    auto last_print = std::chrono::steady_clock::now();
+
+    while (wait_future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_print < std::chrono::milliseconds(500)) {
+        continue;  // throttle console updates
+      }
+      last_print = now;
+
+      const size_t remaining = backlog_now();
+      const double done_ratio =
+        std::clamp(1.0 - static_cast<double>(remaining) / static_cast<double>(backlog0), 0.0, 1.0);
+      const double elapsed = glim_ros::BagProgress::now_sec() - drain_start;
+      const double rate = (backlog0 > remaining && elapsed > 1e-3)
+                            ? (static_cast<double>(backlog0 - remaining) / elapsed)
+                            : 0.0;
+      const double eta = (rate > 1e-6) ? (static_cast<double>(remaining) / rate) : 0.0;
+
+      const int bar_width = 30;
+      const int filled = static_cast<int>(done_ratio * bar_width);
+      std::string bar(filled, '#');
+      bar.resize(bar_width, '.');
+      spdlog::info(
+        "[drain] [{}] {:.1f}% backlog={}/{} wall={:.0f}s eta={:.0f}s",
+        bar, done_ratio * 100.0, remaining, backlog0, elapsed, eta);
     }
 
     wait_future.get();

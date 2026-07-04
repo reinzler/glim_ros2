@@ -59,6 +59,9 @@ public:
   size_t global_mapping_workload();
 
 private:
+  bool accept_stamp(double stamp, const char* source) const;
+
+private:
   std::unique_ptr<glim::TimeKeeper> time_keeper;
   std::unique_ptr<glim::CloudPreprocessor> preprocessor;
 
@@ -70,6 +73,8 @@ private:
   double imu_time_offset;
   double points_time_offset;
   double acc_scale;
+  double stamp_filter_min_sec;
+  double stamp_filter_max_sec;
   bool dump_on_unload;
 
   std::string intensity_field, ring_field;
