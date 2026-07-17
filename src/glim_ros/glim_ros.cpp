@@ -619,6 +619,7 @@ void GlimROS::timer_callback() {
     if (global_mapping) {
       for (const auto& submap : submaps) {
         global_mapping->insert_submap(submap);
+        ++total_submaps_;
       }
     }
   }
@@ -673,103 +674,88 @@ void GlimROS::wait(bool auto_quit) {
   };
 
   auto wait_with_progress = [&](
-    const std::string& label,
-    const std::string& unit_name,
-    const std::function<size_t()>& workload_fn,
-    const std::function<void()>& join_fn) {
-    const auto begin = std::chrono::steady_clock::now();
+  const std::string& label,
+  const std::string& unit_name,
+  const std::function<size_t()>& workload_fn,
+  const std::function<void()>& join_fn) {
+  const auto begin = std::chrono::steady_clock::now();
 
-    size_t initial_pending = 0;
-    try {
-      initial_pending = workload_fn();
-    } catch (...) {
-      initial_pending = 0;
+  size_t pending = 0;
+  try { pending = workload_fn(); } catch (...) {}
+  spdlog::info("\033[1;35m[drain]\033[0m {} started: pending={} unit={}",
+               label, pending, unit_name);
+
+  auto future = std::async(std::launch::async, [&]() { join_fn(); });
+
+  size_t prev_pending = pending;
+  size_t processed_total = 0;                       // монотонный
+  std::deque<std::pair<double, size_t>> rate_win;   // (t_sec, processed_total)
+  size_t last_pending = pending;
+  int stable_pending_sec = 0;
+
+  while (rclcpp::ok()) {
+    const auto status = future.wait_for(std::chrono::milliseconds(500));
+    const auto now = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(now - begin).count();
+
+    try { pending = workload_fn(); } catch (...) { pending = 0; }
+
+    // монотонный прогресс: считаем только УБЫЛЬ очереди
+    if (pending < prev_pending) processed_total += prev_pending - pending;
+    prev_pending = pending;
+
+    stable_pending_sec = (pending == last_pending) ? stable_pending_sec + 1 : 0;
+    last_pending = pending;
+
+    // скользящее окно 20с для скорости
+    rate_win.emplace_back(t, processed_total);
+    while (rate_win.size() > 2 && t - rate_win.front().first > 20.0)
+      rate_win.pop_front();
+
+    double rate = 0.0;  // unit/сек
+    if (rate_win.size() >= 2) {
+      const double dt = rate_win.back().first - rate_win.front().first;
+      const double dp = double(rate_win.back().second - rate_win.front().second);
+      if (dt > 1.0) rate = dp / dt;
     }
 
-    spdlog::info(
-      "\033[1;35m[drain]\033[0m {} started: initial_pending={} unit={}",
-      label,
-      initial_pending,
-      unit_name);
+    const size_t plan = processed_total + pending;   // план растёт с досыпкой
+    const double ratio = plan ? double(processed_total) / plan
+                              : (pending == 0 ? 1.0 : 0.0);
 
-    auto future = std::async(std::launch::async, [&]() {
-      join_fn();
-    });
+    std::string eta = "-";
+    if (pending == 0) eta = "0s";
+    else if (rate > 1e-6) {
+      const int e = int(pending / rate);
+      eta = e >= 60 ? std::to_string(e / 60) + "m" + std::to_string(e % 60) + "s"
+                    : std::to_string(e) + "s";
+    }
 
-    size_t last_pending = initial_pending;
-    int stable_pending_sec = 0;
-
-    while (rclcpp::ok()) {
-      const auto status = future.wait_for(std::chrono::milliseconds(500));
-      const auto now = std::chrono::steady_clock::now();
-      const auto elapsed_sec =
-        std::chrono::duration_cast<std::chrono::seconds>(now - begin).count();
-
-      size_t pending = 0;
-      try {
-        pending = workload_fn();
-      } catch (...) {
-        pending = 0;
-      }
-
-      if (pending == last_pending) {
-        stable_pending_sec++;
-      } else {
-        stable_pending_sec = 0;
-      }
-      last_pending = pending;
-
-      const size_t done_est =
-        initial_pending > pending ? initial_pending - pending : 0;
-
-      const double queue_ratio =
-        initial_pending > 0
-          ? static_cast<double>(done_est) / static_cast<double>(initial_pending)
-          : (pending == 0 ? 1.0 : 0.0);
-
-      const std::string phase =
-        pending > 0 ? "processing_queue" : "finalizing_join";
-
-      const double mem = memory_usage_ratio();
-
-      std::ostringstream oss;
-      oss
-        << "\r\033[1;36m[drain_progress]\033[0m "
-        << label << " "
-        << make_bar(queue_ratio)
-        << " queue=" << done_est << "/" << initial_pending
+    const double mem = memory_usage_ratio();
+    std::ostringstream oss;
+    oss << "\r\033[1;36m[drain_progress]\033[0m " << label << " "
+        << make_bar(ratio)
+        << " done=" << processed_total << "/" << plan
         << " pending=" << pending
+        << " rate=" << std::fixed << std::setprecision(1) << rate << "/s"
+        << " eta=" << eta
         << " unit=" << unit_name
-        << " phase=" << phase
         << " stable=" << stable_pending_sec / 2 << "s"
-        << " elapsed=" << elapsed_sec << "s";
+        << " elapsed=" << int(t) << "s";
+    if (mem >= 0.0) oss << " mem=" << std::setprecision(1) << mem * 100.0 << "%";
+    oss << "      ";
+    std::cerr << oss.str() << std::flush;
 
-      if (mem >= 0.0) {
-        oss << " mem=" << std::fixed << std::setprecision(1) << (mem * 100.0) << "%";
-      }
-
-      oss << "      ";
-
-      std::cerr << oss.str() << std::flush;
-
-      if (status == std::future_status::ready) {
-        future.get();
-        std::cerr << std::endl;
-
-        spdlog::info(
-          "\033[1;32m[drain_done]\033[0m {} done: initial_pending={} final_pending={} elapsed={}s",
-          label,
-          initial_pending,
-          pending,
-          elapsed_sec);
-        return;
-      }
+    if (status == std::future_status::ready) {
+      future.get();
+      std::cerr << std::endl;
+      spdlog::info("\033[1;32m[drain_done]\033[0m {} done: processed={} elapsed={}s",
+                   label, processed_total, int(t));
+      return;
     }
-
-    future.wait();
-    future.get();
-    std::cerr << std::endl;
-  };
+  }
+  future.wait(); future.get(); std::cerr << std::endl;
+};
 
   wait_with_progress(
     "odometry_estimation",

@@ -57,6 +57,7 @@ public:
   size_t odometry_workload();
   size_t local_mapping_workload();
   size_t global_mapping_workload();
+  size_t total_submaps() const { return total_submaps_; }
 
 private:
   bool accept_stamp(double stamp, const char* source) const;
@@ -68,6 +69,7 @@ private:
   std::shared_ptr<glim::AsyncOdometryEstimation> odometry_estimation;
   std::unique_ptr<glim::AsyncSubMapping> sub_mapping;
   std::unique_ptr<glim::AsyncGlobalMapping> global_mapping;
+  std::atomic<size_t> total_submaps_{0};
 
   bool keep_raw_points;
   double imu_time_offset;

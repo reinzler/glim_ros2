@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <filesystem>
+#include <deque>
 #include <iostream>
 #include <future>
 #include <limits>
@@ -1209,18 +1210,60 @@ int main(int argc, char** argv) {
 
   {
     const double save_start = glim_ros::BagProgress::now_sec();
-    spdlog::info("[bag_progress] save begin path={}", dump_path);
+    const size_t total = glim->total_submaps();
+    spdlog::info("[bag_progress] save begin path={} submaps={}", dump_path, total);
 
     auto save_future = std::async(std::launch::async, [&] {
       glim->save(dump_path);
     });
 
-    while (save_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
-      glim_ros::BagProgress::drain_log("save_dump", save_start);
+    // прогресс = число появившихся submap-директорий NNNNNN/ в dump_path
+    const auto count_saved = [&]() -> size_t {
+      size_t n = 0;
+      std::error_code ec;
+      std::filesystem::directory_iterator it(dump_path, ec), end;
+      if (ec) return 0;
+      for (; it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_directory()) continue;
+        const auto name = it->path().filename().string();
+        if (name.size() == 6 &&
+            std::all_of(name.begin(), name.end(), [](char c) { return std::isdigit((unsigned char)c); })) {
+          ++n;
+        }
+      }
+      return n;
+    };
+
+    std::deque<std::pair<double, size_t>> win;  // (t, saved) окно 20с для rate
+    while (save_future.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready) {
+      const double t = glim_ros::BagProgress::now_sec() - save_start;
+      const size_t saved = count_saved();
+      win.emplace_back(t, saved);
+      while (win.size() > 2 && t - win.front().first > 20.0) win.pop_front();
+
+      double rate = 0.0;
+      if (win.size() >= 2) {
+        const double dt = win.back().first - win.front().first;
+        if (dt > 1.0) rate = double(win.back().second - win.front().second) / dt;
+      }
+      std::string eta = "-";
+      if (total > 0 && saved >= total) eta = "0s";
+      else if (rate > 1e-6 && total > saved)
+        eta = std::to_string(int((total - saved) / rate)) + "s";
+
+      const double ratio = total ? std::min(1.0, double(saved) / double(total)) : 0.0;
+      const int w = 30;
+      const int f = int(ratio * w);
+      std::string bar(f, '#');
+      bar.resize(w, '.');
+      spdlog::info("[save] [{}] {}/{} submaps rate={:.1f}/s eta={} wall={:.0f}s",
+                   bar, saved, total, rate, eta, t);
     }
 
     save_future.get();
-    glim_ros::BagProgress::drain_log("save_dump_done", save_start);
+    spdlog::info("[save] done: {}/{} submaps, {:.0f}s",
+                 count_saved(), total, glim_ros::BagProgress::now_sec() - save_start);
   }
 
   return 0;
