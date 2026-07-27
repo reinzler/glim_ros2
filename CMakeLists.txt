@@ -64,6 +64,9 @@ ament_auto_add_executable(glim_rosnode
 target_link_libraries(glim_rosnode
   glim_ros
 )
+ament_target_dependencies(glim_rosnode
+  std_srvs
+)
 
 ### glim_rosbag ###
 ament_auto_add_executable(glim_rosbag

@@ -503,6 +503,26 @@ int main(int argc, char** argv) {
   rclcpp::NodeOptions options;
   auto glim = std::make_shared<glim::GlimROS>(options);
 
+  // Runtime switch for the original per-message workload throttle.
+  // This throttle predates workload_pause_enabled and otherwise remains
+  // active even when the newer workload guard is disabled.
+  const bool legacy_workload_throttle_enabled = [] {
+    const char* value =
+      std::getenv("GLIM_ROSBAG_LEGACY_WORKLOAD_THROTTLE");
+
+    if (value == nullptr) {
+      return true;
+    }
+
+    const std::string mode(value);
+    return mode != "0" && mode != "false" && mode != "off";
+  }();
+
+  spdlog::info(
+    "[legacy_throttle] enabled={}",
+    legacy_workload_throttle_enabled);
+
+
   // Built-in RViz/trajectory publisher for offline rosbag processing.
   // Publishes /glim/odom-like private topics; for node name "glim_ros" this is /glim_ros/odom.
   auto rviz_viewer = std::make_shared<glim::RvizViewer>();
@@ -1012,7 +1032,7 @@ int main(int argc, char** argv) {
               spdlog::info("end_time reached");
               return false;
             }
-            if (workload > 5) {
+            if (legacy_workload_throttle_enabled && workload > 5) {
               const size_t sleep_msec = (workload - 4) * 5;
               spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);
               std::this_thread::sleep_for(std::chrono::milliseconds(sleep_msec));
@@ -1037,7 +1057,7 @@ int main(int argc, char** argv) {
             return false;
           }
 
-          if (workload > 5) {
+          if (legacy_workload_throttle_enabled && workload > 5) {
             // Odometry estimation is behind
             const size_t sleep_msec = (workload - 4) * 5;
             spdlog::debug("throttling: {} msec (workload={})", sleep_msec, workload);

@@ -2,7 +2,9 @@
 
 #define GLIM_ROS2
 
+#include <atomic>
 #include <deque>
+#include <memory>
 #include <thread>
 #include <iostream>
 #include <string>
@@ -37,6 +39,8 @@
 #include <glim/odometry/callbacks.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
+#include <glim/mapping/callbacks.hpp>
+#include <glim_ros/drain_monitor.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
 #include <glim_ros/multi_lidar_cloud_merger.hpp>
@@ -50,6 +54,24 @@
 #include <limits>
 
 namespace glim {
+
+namespace {
+
+// Живой монитор пропускной способности.
+//
+// Держится в анонимном namespace, чтобы не трогать glim_ros.hpp:
+// в процессе всегда ровно один экземпляр GlimROS. Если понадобится
+// несколько — перенеси эти четыре поля в класс.
+//
+// Отличие от [drain_progress]: тот работает только внутри wait(),
+// то есть уже после save_and_finish. Этот работает с момента старта
+// узла и отвечает на вопрос "успевает ли одометрия за сенсором".
+std::unique_ptr<DrainMonitor> g_monitor;
+std::atomic<uint64_t> g_odom_done{0};
+std::atomic<uint64_t> g_sub_done{0};
+std::atomic<uint64_t> g_glob_done{0};
+
+}  // namespace
 
 GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options) {
   // Setup logger
@@ -315,14 +337,58 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     sub->create_subscriber(*this);
   }
 
+  // --- Живой монитор пропускной способности -------------------------------
+  // Номинальная частота одометрии берётся из конфига: это бюджет реального
+  // времени. Для MID-360 = 10 Гц. RTF < 1.0 означает, что кадры копятся
+  // в очереди быстрее, чем обрабатываются -> рано или поздно OOM.
+  {
+    const Config config_ros_mon(GlobalConfig::get_config_path("config_ros"));
+    const double odom_nominal_hz = config_ros_mon.param<double>("glim_ros", "monitor_nominal_hz", 10.0);
+    const bool monitor_enabled = config_ros_mon.param<bool>("glim_ros", "monitor_enabled", true);
+
+    if (monitor_enabled) {
+      // Счётчик обработанных кадров одометрии.
+      // on_new_frame срабатывает в потоке оценки на каждый обработанный кадр.
+      OdometryEstimationCallbacks::on_new_frame.add([](const EstimationFrame::ConstPtr&) { g_odom_done++; });
+
+      // Счётчик сабмапов, реально принятых глобальным маппингом.
+      GlobalMappingCallbacks::on_insert_submap.add([](const SubMap::ConstPtr&) { g_glob_done++; });
+
+      DrainMonitor::Options mon_opts;
+      mon_opts.poll_interval_ms = 500;
+      mon_opts.print_interval_ms = 1000;
+      mon_opts.rate_window_sec = 30.0;
+
+      g_monitor = std::make_unique<DrainMonitor>(mon_opts);
+
+      g_monitor->add_stage(
+        {"odom", [this] { return odometry_estimation ? odometry_estimation->workload() : 0; }, [] { return g_odom_done.load(); }, odom_nominal_hz});
+
+      g_monitor->add_stage({"sub", [this] { return sub_mapping ? sub_mapping->workload() : 0; }, [] { return g_sub_done.load(); }, 0.0});
+
+      g_monitor->add_stage({"glob", [this] { return global_mapping ? global_mapping->workload() : 0; }, [] { return g_glob_done.load(); }, 0.0});
+
+      g_monitor->start();
+      spdlog::info("[monitor] throughput monitor started (odom budget = {:.1f} Hz)", odom_nominal_hz);
+    }
+  }
+
   // Start timer
-  timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+  timer = this->create_wall_timer(std::chrono::milliseconds(10), [this]() { timer_callback(); });
 
   spdlog::debug("initialized");
 }
 
 GlimROS::~GlimROS() {
   spdlog::debug("quit");
+
+  // Монитор держит лямбды на odometry_estimation / sub_mapping / global_mapping,
+  // поэтому останавливается ПЕРВЫМ — до разрушения модулей.
+  if (g_monitor) {
+    g_monitor->stop();
+    g_monitor.reset();
+  }
+
   extension_modules.clear();
 
   if (dump_on_unload) {
@@ -616,6 +682,8 @@ void GlimROS::timer_callback() {
     }
 
     auto submaps = sub_mapping->get_results();
+    g_sub_done += submaps.size();
+
     if (global_mapping) {
       for (const auto& submap : submaps) {
         global_mapping->insert_submap(submap);
@@ -626,6 +694,12 @@ void GlimROS::timer_callback() {
 }
 
 void GlimROS::wait(bool auto_quit) {
+  // Вход закрылся: с этого момента ETA имеет смысл (total больше не растёт).
+  // До этого монитор печатал eta=n/a, чтобы не врать.
+  if (g_monitor) {
+    g_monitor->set_input_closed();
+  }
+
   auto memory_usage_ratio = []() -> double {
     std::ifstream ifs("/proc/meminfo");
     if (!ifs) {

@@ -11,6 +11,7 @@
 
   <depend>glim</depend>
   <depend>rclcpp</depend>
+  <depend>std_srvs</depend>
   <depend>rclcpp_components</depend>
   <depend>rosbag2_cpp</depend>
   <depend>rosbag2_compression</depend>
