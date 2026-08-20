@@ -1127,7 +1127,8 @@ int main(int argc, char** argv) {
       auto found = subscription_map.find(msg->topic_name);
       if (found != subscription_map.end()) {
         for (const auto& sub : found->second) {
-          sub->insert_message_instance(serialized_msg, topic_type);
+          sub->insert_message_instance(
+            serialized_msg, topic_type, static_cast<double>(msg_time) * 1e-9);
         }
       }
 
