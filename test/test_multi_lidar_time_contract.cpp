@@ -247,7 +247,7 @@ const PointField* find_field(const PointCloud2& msg, const std::string& name) {
 
 void check_merged_schema(const PointCloud2& msg) {
   check(msg.fields.size() == 7, "merged field count");
-  check(msg.point_step == 23, "merged point_step must be 23");
+  check(msg.point_step == 24, "merged point_step must be 24");
   check(msg.row_step == msg.point_step * msg.width, "merged row_step");
 
   const auto* x = find_field(msg, "x");

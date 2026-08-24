@@ -890,7 +890,8 @@ MultiLidarCloudMerger::build_msg(
   out->fields[6].datatype = sensor_msgs::msg::PointField::UINT8;
   out->fields[6].count = 1;
 
-  out->point_step = 23;
+  // Keep each point record aligned to four bytes. The final byte is padding.
+  out->point_step = 24;
   out->row_step = out->point_step * out->width;
   out->data.resize(static_cast<std::size_t>(out->row_step));
 
