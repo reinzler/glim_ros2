@@ -59,6 +59,9 @@ public:
   size_t global_mapping_workload();
   size_t total_submaps() const { return total_submaps_; }
 
+  /** Request force-close of the open local submap (workload_guard antidote). */
+  void request_local_mapping_force_close();
+
 private:
   bool accept_stamp(double stamp, const char* source) const;
 

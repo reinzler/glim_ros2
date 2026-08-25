@@ -655,6 +655,12 @@ size_t GlimROS::global_mapping_workload() {
   return global_mapping ? global_mapping->workload() : 0;
 }
 
+void GlimROS::request_local_mapping_force_close() {
+  if (sub_mapping) {
+    sub_mapping->request_force_close_submap();
+  }
+}
+
 bool GlimROS::needs_wait() {
   for (const auto& ext_module : extension_modules) {
     if (ext_module->needs_wait()) {

@@ -204,6 +204,11 @@ struct WorkloadPauseConfig {
 
   int global_mapping_pause_high = 20;
   int global_mapping_resume_low = 5;
+
+  // Legacy hysteresis-only pause (can deadlock). Default OFF path uses force-close.
+  bool force_submap_on_pause = true;
+  // If paused and local queue does not decrease for this many seconds, force-resume.
+  double pause_watchdog_sec = 30.0;
 };
 
 
@@ -438,13 +443,22 @@ void wait_for_workload_if_needed(
   }
 
   spdlog::warn(
-    "[workload_guard] pausing rosbag reading: {} workloads odom={} local={} global={}",
+    "[workload_guard] pause: {} workloads odom={} local={} global={} force_submap_on_pause={}",
     reason,
     odom,
     local,
-    global);
+    global,
+    cfg.force_submap_on_pause);
+
+  if (cfg.force_submap_on_pause && glim) {
+    glim->request_local_mapping_force_close();
+    spdlog::warn("[workload_guard] requested force_close_submap on pause");
+  }
 
   auto last_log = std::chrono::steady_clock::now();
+  const auto pause_start = last_log;
+  size_t local_at_pause = local;
+  auto last_progress = pause_start;
 
   while (rclcpp::ok()) {
     rclcpp::spin_some(glim);
@@ -456,9 +470,14 @@ void wait_for_workload_if_needed(
     local = get_local();
     global = get_global();
 
+    if (local < local_at_pause) {
+      local_at_pause = local;
+      last_progress = std::chrono::steady_clock::now();
+    }
+
     if (all_below_resume(odom, local, global)) {
       spdlog::warn(
-        "[workload_guard] resuming rosbag reading: workloads odom={} local={} global={} "
+        "[workload_guard] resume: workloads odom={} local={} global={} "
         "resume_low odom={} local={} global={}",
         odom,
         local,
@@ -470,19 +489,33 @@ void wait_for_workload_if_needed(
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const double since_progress =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - last_progress).count();
+    if (cfg.pause_watchdog_sec > 0.0 && since_progress >= cfg.pause_watchdog_sec) {
+      spdlog::error(
+        "[workload_guard] watchdog force-resume after {:.1f}s without local queue progress "
+        "(odom={} local={} global={})",
+        since_progress,
+        odom,
+        local,
+        global);
+      return;
+    }
+
     const double elapsed =
       std::chrono::duration_cast<std::chrono::duration<double>>(now - last_log).count();
 
     if (elapsed >= cfg.log_interval_sec) {
       spdlog::warn(
         "[workload_guard] still paused: workloads odom={} local={} global={} "
-        "resume_low odom={} local={} global={}",
+        "resume_low odom={} local={} global={} since_progress={:.1f}s",
         odom,
         local,
         global,
         cfg.odom_resume_low,
         cfg.local_mapping_resume_low,
-        cfg.global_mapping_resume_low);
+        cfg.global_mapping_resume_low,
+        since_progress);
       last_log = now;
     }
 
@@ -804,6 +837,10 @@ int main(int argc, char** argv) {
     config_ros.param<int>("glim_rosbag", "global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
   workload_pause_cfg.global_mapping_resume_low =
     config_ros.param<int>("glim_rosbag", "global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+  workload_pause_cfg.force_submap_on_pause =
+    config_ros.param<bool>("glim_rosbag", "workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
+  workload_pause_cfg.pause_watchdog_sec =
+    config_ros.param<double>("glim_rosbag", "workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
 
   glim->declare_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
   glim->declare_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
@@ -817,6 +854,8 @@ int main(int argc, char** argv) {
 
   glim->declare_parameter("glim_rosbag/global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
   glim->declare_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+  glim->declare_parameter("glim_rosbag/workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
+  glim->declare_parameter("glim_rosbag/workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
 
   glim->get_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
   glim->get_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
@@ -830,9 +869,11 @@ int main(int argc, char** argv) {
 
   glim->get_parameter("glim_rosbag/global_mapping_pause_high", workload_pause_cfg.global_mapping_pause_high);
   glim->get_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
+  glim->get_parameter("glim_rosbag/workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
+  glim->get_parameter("glim_rosbag/workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
 
   spdlog::info(
-    "[workload_guard] enabled={} check={}ms odom={}/{} local={}/{} global={}/{}",
+    "[workload_guard] enabled={} check={}ms odom={}/{} local={}/{} global={}/{} force_submap={} watchdog={:.1f}s",
     workload_pause_cfg.enabled,
     workload_pause_cfg.check_interval_ms,
     workload_pause_cfg.odom_pause_high,
@@ -840,9 +881,9 @@ int main(int argc, char** argv) {
     workload_pause_cfg.local_mapping_pause_high,
     workload_pause_cfg.local_mapping_resume_low,
     workload_pause_cfg.global_mapping_pause_high,
-    workload_pause_cfg.global_mapping_resume_low);
-
-
+    workload_pause_cfg.global_mapping_resume_low,
+    workload_pause_cfg.force_submap_on_pause,
+    workload_pause_cfg.pause_watchdog_sec);
 
   // Bag read function
   bool bag_truncated = false;   // set true if a bag ends early due to a read error
