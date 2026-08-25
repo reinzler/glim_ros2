@@ -209,6 +209,9 @@ struct WorkloadPauseConfig {
   bool force_submap_on_pause = true;
   // If paused and local queue does not decrease for this many seconds, force-resume.
   double pause_watchdog_sec = 30.0;
+  // After force_close: require this many consecutive below-resume polls before resume
+  // (avoids pause↔resume thrash when the queue briefly dips then refills).
+  int post_force_close_resume_stable_checks = 3;
 };
 
 
@@ -450,7 +453,8 @@ void wait_for_workload_if_needed(
     global,
     cfg.force_submap_on_pause);
 
-  if (cfg.force_submap_on_pause && glim) {
+  const bool requested_force_close = cfg.force_submap_on_pause && static_cast<bool>(glim);
+  if (requested_force_close) {
     glim->request_local_mapping_force_close();
     spdlog::warn("[workload_guard] requested force_close_submap on pause");
   }
@@ -459,6 +463,9 @@ void wait_for_workload_if_needed(
   const auto pause_start = last_log;
   size_t local_at_pause = local;
   auto last_progress = pause_start;
+  int below_resume_streak = 0;
+  const int stable_needed =
+    requested_force_close ? std::max(1, cfg.post_force_close_resume_stable_checks) : 1;
 
   while (rclcpp::ok()) {
     rclcpp::spin_some(glim);
@@ -476,16 +483,23 @@ void wait_for_workload_if_needed(
     }
 
     if (all_below_resume(odom, local, global)) {
-      spdlog::warn(
-        "[workload_guard] resume: workloads odom={} local={} global={} "
-        "resume_low odom={} local={} global={}",
-        odom,
-        local,
-        global,
-        cfg.odom_resume_low,
-        cfg.local_mapping_resume_low,
-        cfg.global_mapping_resume_low);
-      return;
+      ++below_resume_streak;
+      if (below_resume_streak >= stable_needed) {
+        spdlog::warn(
+          "[workload_guard] resume: workloads odom={} local={} global={} "
+          "resume_low odom={} local={} global={} stable_checks={}/{}",
+          odom,
+          local,
+          global,
+          cfg.odom_resume_low,
+          cfg.local_mapping_resume_low,
+          cfg.global_mapping_resume_low,
+          below_resume_streak,
+          stable_needed);
+        return;
+      }
+    } else {
+      below_resume_streak = 0;
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -841,6 +855,10 @@ int main(int argc, char** argv) {
     config_ros.param<bool>("glim_rosbag", "workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
   workload_pause_cfg.pause_watchdog_sec =
     config_ros.param<double>("glim_rosbag", "workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
+  workload_pause_cfg.post_force_close_resume_stable_checks = config_ros.param<int>(
+    "glim_rosbag",
+    "workload_post_force_close_resume_stable_checks",
+    workload_pause_cfg.post_force_close_resume_stable_checks);
 
   glim->declare_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
   glim->declare_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
@@ -856,6 +874,9 @@ int main(int argc, char** argv) {
   glim->declare_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
   glim->declare_parameter("glim_rosbag/workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
   glim->declare_parameter("glim_rosbag/workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
+  glim->declare_parameter(
+    "glim_rosbag/workload_post_force_close_resume_stable_checks",
+    workload_pause_cfg.post_force_close_resume_stable_checks);
 
   glim->get_parameter("glim_rosbag/workload_pause_enabled", workload_pause_cfg.enabled);
   glim->get_parameter("glim_rosbag/workload_pause_check_interval_ms", workload_pause_cfg.check_interval_ms);
@@ -871,9 +892,13 @@ int main(int argc, char** argv) {
   glim->get_parameter("glim_rosbag/global_mapping_resume_low", workload_pause_cfg.global_mapping_resume_low);
   glim->get_parameter("glim_rosbag/workload_force_submap_on_pause", workload_pause_cfg.force_submap_on_pause);
   glim->get_parameter("glim_rosbag/workload_pause_watchdog_sec", workload_pause_cfg.pause_watchdog_sec);
+  glim->get_parameter(
+    "glim_rosbag/workload_post_force_close_resume_stable_checks",
+    workload_pause_cfg.post_force_close_resume_stable_checks);
 
   spdlog::info(
-    "[workload_guard] enabled={} check={}ms odom={}/{} local={}/{} global={}/{} force_submap={} watchdog={:.1f}s",
+    "[workload_guard] enabled={} check={}ms odom={}/{} local={}/{} global={}/{} force_submap={} "
+    "watchdog={:.1f}s post_force_stable={}",
     workload_pause_cfg.enabled,
     workload_pause_cfg.check_interval_ms,
     workload_pause_cfg.odom_pause_high,
@@ -883,7 +908,8 @@ int main(int argc, char** argv) {
     workload_pause_cfg.global_mapping_pause_high,
     workload_pause_cfg.global_mapping_resume_low,
     workload_pause_cfg.force_submap_on_pause,
-    workload_pause_cfg.pause_watchdog_sec);
+    workload_pause_cfg.pause_watchdog_sec,
+    workload_pause_cfg.post_force_close_resume_stable_checks);
 
   // Bag read function
   bool bag_truncated = false;   // set true if a bag ends early due to a read error
